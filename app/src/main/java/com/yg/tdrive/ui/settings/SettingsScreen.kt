@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -23,11 +24,13 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -37,12 +40,17 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import com.yg.tgdrive.ServiceLocator
+import com.yg.tgdrive.settings.CredentialsStore
 import com.yg.tgdrive.ui.common.DriveEntity
 import com.yg.tgdrive.ui.common.ProxyEditor
 import com.yg.tgdrive.ui.common.ProxyMode
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * 设置页（SPEC §4.5）：驱动器管理（列表+删除+手动重扫）· 并发滑杆 1~8 ·
@@ -147,6 +155,9 @@ fun SettingsScreen(onBack: () -> Unit) {
                     ProxyEditor(initialMode = ProxyMode.None, onSaved = { /* 已提示重启 */ })
                 }
             }
+
+            // ---------- API 凭据 ----------
+            CredentialsSection()
 
             // ---------- 退出登录 ----------
             OutlinedButton(
@@ -297,5 +308,160 @@ private fun DriveSection() {
             },
             dismissButton = { TextButton(onClick = { confirmDeleteFor = null }) { Text("取消") } },
         )
+    }
+}
+
+// ---------------------------------------------------------------- API 凭据
+
+private val ApiHashPattern = Regex("^[0-9a-fA-F]{32}$")
+
+/** 只露前 6 位，绝不回显完整 api_hash（短于 7 位则整体隐藏）。 */
+private fun maskHash(hash: String): String =
+    if (hash.length > 6) hash.take(6) + "…" else "…"
+
+/**
+ * 自定义 API 凭据（TDLib api_id/api_hash）：可折叠区块。
+ * - 状态行显示当前来源（内置 / 自定义）+ api_id + 掩码 hash
+ * - 校验：api_id 正整数、api_hash 32 位十六进制；不合法禁用保存并就地提示
+ * - 保存/恢复内置写 CredentialsStore，重启应用后生效
+ */
+@Composable
+private fun CredentialsSection() {
+    var expanded by remember { mutableStateOf(false) }
+    var custom by remember { mutableStateOf<Pair<Int, String>?>(null) }
+    var loaded by remember { mutableStateOf(false) }
+    var idText by remember { mutableStateOf("") }
+    var hashText by remember { mutableStateOf("") }
+    var feedback by remember { mutableStateOf<String?>(null) }
+    var error by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+
+    suspend fun reload() {
+        val saved = withContext(Dispatchers.IO) {
+            runCatching { ServiceLocator.credentials.get() }.getOrNull()
+        }
+        custom = saved
+        loaded = true
+    }
+    LaunchedEffect(Unit) { reload() }
+
+    val activeId = custom?.first ?: CredentialsStore.BUILT_IN_API_ID
+    val activeHash = custom?.second ?: CredentialsStore.BUILT_IN_API_HASH
+    val idValue = idText.trim().toIntOrNull()
+    val idOk = idValue != null && idValue > 0
+    val hashOk = ApiHashPattern.matches(hashText.trim())
+    val canSave = idOk && hashOk
+
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("API 凭据", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        when {
+                            !loaded -> "读取中…"
+                            custom == null -> "当前：内置凭据"
+                            else -> "当前：自定义凭据"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
+                TextButton(onClick = { expanded = !expanded }) {
+                    Text(if (expanded) "收起" else "展开")
+                }
+            }
+            if (loaded) {
+                Text(
+                    "api_id = $activeId · api_hash = ${maskHash(activeHash)}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
+            if (expanded) {
+                Spacer(Modifier.height(12.dp))
+                Text(
+                    "自定义凭据用于自有 Telegram 应用（my.telegram.org 申请）。修改后需重启应用生效，已登录会话可能需重新登录。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = idText,
+                    onValueChange = { idText = it; error = null },
+                    label = { Text("api_id（正整数）") },
+                    singleLine = true,
+                    isError = idText.isNotBlank() && !idOk,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = hashText,
+                    onValueChange = { hashText = it; error = null },
+                    label = { Text("api_hash（32 位十六进制）") },
+                    singleLine = true,
+                    isError = hashText.isNotBlank() && !hashOk,
+                    visualTransformation = PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(8.dp))
+
+                val hint = when {
+                    idText.isNotBlank() && !idOk -> "api_id 必须是正整数"
+                    hashText.isNotBlank() && !hashOk -> "api_hash 必须是 32 位十六进制"
+                    else -> null
+                }
+                if (hint != null) {
+                    Text(hint, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                    Spacer(Modifier.height(4.dp))
+                }
+                error?.let {
+                    Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                    Spacer(Modifier.height(4.dp))
+                }
+                feedback?.let {
+                    Text(it, color = MaterialTheme.colorScheme.tertiary, style = MaterialTheme.typography.bodySmall)
+                    Spacer(Modifier.height(4.dp))
+                }
+
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Button(
+                        onClick = {
+                            val id = idText.trim().toIntOrNull()
+                            val hash = hashText.trim().lowercase()
+                            if (id == null || id <= 0 || !ApiHashPattern.matches(hash)) {
+                                error = "请检查 api_id 与 api_hash 格式"
+                                return@Button
+                            }
+                            scope.launch {
+                                withContext(Dispatchers.IO) { ServiceLocator.credentials.set(id, hash) }
+                                idText = ""
+                                hashText = ""
+                                error = null
+                                feedback = "已保存自定义凭据（api_id=$id），重启应用后生效。"
+                                reload()
+                            }
+                        },
+                        enabled = canSave,
+                    ) { Text("保存") }
+                    OutlinedButton(
+                        onClick = {
+                            scope.launch {
+                                withContext(Dispatchers.IO) { ServiceLocator.credentials.clear() }
+                                idText = ""
+                                hashText = ""
+                                error = null
+                                feedback = "已恢复内置凭据，重启应用后生效。"
+                                reload()
+                            }
+                        },
+                        enabled = loaded && custom != null,
+                    ) { Text("恢复内置") }
+                }
+            }
+        }
     }
 }
