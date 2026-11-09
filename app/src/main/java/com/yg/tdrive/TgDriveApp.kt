@@ -15,7 +15,7 @@ class TgDriveApp : Application() {
         ServiceLocator.appScope.launch {
             val sl = ServiceLocator
             sl.settings.proxy.first()?.let { snapshot ->
-                runCatching { sl.proxyManager.apply(snapshot.toConfig()) }
+                runCatching { sl.proxyManager.applySnapshot(snapshot, sl.context) }
             }
             val (apiId, apiHash) = sl.credentials.getOrBuiltIn()
             runCatching {

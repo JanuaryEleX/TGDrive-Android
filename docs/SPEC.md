@@ -104,7 +104,16 @@ WAIT_OTHER_DEVICE(扫码可用 QR) → WAIT_PHONE_NUMBER → setAuthenticationPh
 ```
 错误码处理：`PHONE_CODE_INVALID`/`PHONE_NUMBER_INVALID`/`PASSWORD_HASH_INVALID` → UI 原地重输；连续 3 次失败 → 提示冷却。
 
-**代理**：onboarding 第一步，`addProxy(server, port, enable=true, type)` 支持 MTProto（secret）与 SOCKS5；提供 `testProxy` 延迟测试；可跳过（直连）。代理配置变更 = 重建 client（TDLib 不支持运行时换代理，重建成本可接受）。
+**代理**：onboarding 第一步，`addProxy(server, port, enable=true, type)` 支持 MTProto（secret）、SOCKS5 与 HTTP；提供 `testProxy` 延迟测试；可跳过（直连）。代理配置变更 = 重建 client（TDLib 不支持运行时换代理，重建成本可接受）。
+
+**跟随系统代理**（`proxyKind = "system"`）：TDLib 自身不读 Android 系统代理，故由 `SystemProxyResolver` 在启动/登录链路读取
+`ConnectivityManager.getLinkProperties(activeNetwork)?.httpProxy`（为空再退回已废弃的 `getDefaultProxy()`），
+翻译成 `proxyTypeHttp`（`username`/`password`/`http_only=false`）后交给 `addProxy`。限制：
+
+- 仅 HTTP 代理；TDLib 的 HTTP 代理只做 CONNECT 隧道，不解析 PAC —— `pacFileUrl` 非空而 host 为空时视为「无代理」。
+- 忽略 `ProxyInfo.getExclusionList()`（TDLib 无 per-host 绕过能力），宁可全部走代理。
+- 探测不到可用代理（未设置 / `isValid()` 为假 / 端口越界）时**退化为直连**，不报错。
+- 系统代理只在启动时解析一次；运行中切换 Wi-Fi/代理需重启应用（与手填代理同一约束）。
 
 **TdClient 公开接口**：
 

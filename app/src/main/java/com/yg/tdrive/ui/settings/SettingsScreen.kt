@@ -152,7 +152,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                     Spacer(Modifier.height(8.dp))
-                    ProxyEditor(initialMode = ProxyMode.None, onSaved = { /* 已提示重启 */ })
+                    ProxyEditor(initialMode = ProxyMode.Direct, onSaved = { /* 已提示重启 */ })
                 }
             }
 

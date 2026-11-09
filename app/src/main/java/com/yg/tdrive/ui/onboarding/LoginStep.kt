@@ -38,8 +38,8 @@ fun LoginStepContent(onReady: () -> Unit) {
     // 进入登录步骤：应用已保存代理 + TDLib initialize（幂等，冷启动已跑也安全）
     LaunchedEffect(Unit) {
         val sl = ServiceLocator
-            sl.settings.proxy.first()?.let { snapshot ->
-            runCatching { sl.proxyManager.apply(snapshot.toConfig()) }
+        sl.settings.proxy.first()?.let { snapshot ->
+            runCatching { sl.proxyManager.applySnapshot(snapshot, sl.context) }
         }
         val (apiId, apiHash) = sl.credentials.getOrBuiltIn()
         runCatching {

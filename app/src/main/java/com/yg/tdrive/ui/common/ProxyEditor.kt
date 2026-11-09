@@ -21,6 +21,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
@@ -28,20 +29,29 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.text.KeyboardOptions
 import com.yg.tgdrive.ServiceLocator
 import com.yg.tgdrive.settings.ProxySnapshot
+import com.yg.tgdrive.td.ProxyConfig
+import com.yg.tgdrive.td.SystemProxyResolver
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * 代理编辑组件（onboarding 第③步 + 设置页复用）。
- * - 三选：MTProto(server/port/secret) / SOCKS5(server/port/user/pass) / 直连
- * - 「测试延迟」调 TdProxyManager.test 显示 ms
- * - 保存写 SettingsStore.setProxy（proxyManager.apply 由 lead 在登录/启动链路统一处理）
+ * - 四选：MTProto(server/port/secret) / SOCKS5(server/port/user/pass) / 跟随系统 / 直连
+ * - 「跟随系统」实时探测系统 HTTP 代理（仅 HTTP CONNECT，不支持 PAC；无代理则直连）
+ * - 「测试延迟」调 TdProxyManager.test 显示 ms（含探测到的 HTTP 代理）
+ * - 保存写 SettingsStore.setProxy（proxyManager.apply 由登录/启动链路统一处理）
  * - 设置页保存后提示重启（TDLib 不支持运行时换代理）
+ *
+ * @param isOnboarding onboarding 用：不显示重启提示、不回填已存配置，
+ *   且 [ProxyMode.Direct] 渲染为「跳过（直连）」。设置页传 false。
  */
 @Composable
 fun ProxyEditor(
     initialMode: ProxyMode,
     onSaved: () -> Unit,
+    isOnboarding: Boolean = false,
 ) {
     var mode by remember { mutableStateOf(initialMode) }
     var server by remember { mutableStateOf("") }
@@ -54,12 +64,18 @@ fun ProxyEditor(
     var testResult by remember { mutableStateOf<String?>(null) }
     var restartHint by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
+    val context = LocalContext.current
+
+    // 系统代理探测结果；probeNonce 变化即重新检测
+    var detected by remember { mutableStateOf<ProxyConfig.Http?>(null) }
+    var probed by remember { mutableStateOf(false) }
+    var probeNonce by remember { mutableStateOf(0) }
 
     // 设置页进入时回填当前已存代理（onboarding 进入时为空）
     LaunchedEffect(Unit) {
-        if (initialMode != ProxyMode.Skip) {
+        if (!isOnboarding) {
             when (val p = ServiceLocator.settings.proxy.first()) {
-                null -> mode = ProxyMode.None
+                null -> mode = ProxyMode.Direct
                 is ProxySnapshot.Mt -> {
                     mode = ProxyMode.MTProto
                     server = p.server; port = p.port.toString(); secret = p.secret
@@ -69,7 +85,17 @@ fun ProxyEditor(
                     server = p.server; port = p.port.toString()
                     user = p.user ?: ""; pass = p.pass ?: ""
                 }
+                is ProxySnapshot.System -> mode = ProxyMode.System
             }
+        }
+    }
+
+    LaunchedEffect(mode, probeNonce) {
+        if (mode == ProxyMode.System) {
+            probed = false
+            testResult = null
+            detected = withContext(Dispatchers.IO) { SystemProxyResolver.resolve(context) }
+            probed = true
         }
     }
 
@@ -86,11 +112,13 @@ fun ProxyEditor(
                 label = { Text("SOCKS5") },
             )
             FilterChip(
-                selected = mode == ProxyMode.Skip || mode == ProxyMode.None,
-                onClick = {
-                    mode = if (initialMode == ProxyMode.Skip) ProxyMode.Skip else ProxyMode.None
-                    testResult = null; error = null
-                },
+                selected = mode == ProxyMode.System,
+                onClick = { mode = ProxyMode.System; testResult = null; error = null },
+                label = { Text("跟随系统") },
+            )
+            FilterChip(
+                selected = mode == ProxyMode.Direct,
+                onClick = { mode = ProxyMode.Direct; testResult = null; error = null },
                 label = { Text("直连") },
             )
         }
@@ -107,9 +135,69 @@ fun ProxyEditor(
                 LabeledField("用户名（可空）", user) { user = it }
                 LabeledField("密码（可空）", pass, isPassword = true) { pass = it }
             }
-            ProxyMode.Skip, ProxyMode.None -> {
+            ProxyMode.System -> {
+                Text(
+                    "读取当前网络的系统 HTTP 代理（Wi-Fi/以太网手动代理），仅走 HTTP CONNECT；" +
+                        "PAC 脚本不支持。未检测到代理时自动直连。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                val hit = detected
+                when {
+                    !probed -> Text(
+                        "检测中…",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    hit != null -> Text(
+                        "检测到系统代理 ${hit.server}:${hit.port}",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                    else -> Text(
+                        "当前系统未设置代理，将直连",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    OutlinedButton(onClick = { probeNonce++ }) { Text("重新检测") }
+                    if (hit != null) {
+                        OutlinedButton(
+                            onClick = {
+                                testing = true
+                                testResult = null
+                                scope.launch {
+                                    val ms = ServiceLocator.proxyManager.test(hit)
+                                    testing = false
+                                    testResult = if (ms != null) "延迟 $ms ms" else "测试失败，请检查配置"
+                                }
+                            },
+                            enabled = !testing,
+                        ) { Text(if (testing) "测试中…" else "测试延迟") }
+                    }
+                    if (testing) CircularProgressIndicator(modifier = Modifier.size(20.dp))
+                    testResult?.let {
+                        Text(
+                            it,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = if (it.startsWith("延迟")) MaterialTheme.colorScheme.primary
+                            else MaterialTheme.colorScheme.error,
+                        )
+                    }
+                }
+            }
+            ProxyMode.Direct -> {
                 Text(
                     "不使用代理，直连 Telegram。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    "已开启全局 VPN / TUN 模式时选此项即可，无需填代理。",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -135,9 +223,9 @@ fun ProxyEditor(
                             testResult = null
                             scope.launch {
                                 val cfg = if (mode == ProxyMode.MTProto) {
-                                    com.yg.tgdrive.td.ProxyConfig.MtProto(server.trim(), p!!, secret.trim())
+                                    ProxyConfig.MtProto(server.trim(), p!!, secret.trim())
                                 } else {
-                                    com.yg.tgdrive.td.ProxyConfig.Socks5(
+                                    ProxyConfig.Socks5(
                                         server.trim(), p!!,
                                         user.trim().ifBlank { null },
                                         pass.ifBlank { null },
@@ -173,7 +261,7 @@ fun ProxyEditor(
 
         Button(
             onClick = {
-                val snapshot = when (mode) {
+                val snapshot: ProxySnapshot? = when (mode) {
                     ProxyMode.MTProto -> {
                         val p = port.toIntOrNull()
                         when {
@@ -194,15 +282,16 @@ fun ProxyEditor(
                             else -> ProxySnapshot.Socks(
                                 server.trim(), p,
                                 user.trim().ifBlank { null },
-                                pass.ifBlank { null },
+                                pass.trim().ifBlank { null },
                             )
                         }
                     }
-                    else -> null
+                    ProxyMode.System -> ProxySnapshot.System
+                    ProxyMode.Direct -> null
                 }
                 scope.launch {
                     ServiceLocator.settings.setProxy(snapshot)
-                    restartHint = initialMode != ProxyMode.Skip && snapshot != null
+                    restartHint = !isOnboarding
                     onSaved()
                 }
             },
@@ -212,7 +301,8 @@ fun ProxyEditor(
                 when (mode) {
                     ProxyMode.MTProto -> "保存 MTProto 代理"
                     ProxyMode.Socks5 -> "保存 SOCKS5 代理"
-                    else -> if (initialMode == ProxyMode.Skip) "跳过（直连）" else "保存为直连"
+                    ProxyMode.System -> "保存为跟随系统"
+                    ProxyMode.Direct -> if (isOnboarding) "跳过（直连）" else "保存为直连"
                 },
             )
         }

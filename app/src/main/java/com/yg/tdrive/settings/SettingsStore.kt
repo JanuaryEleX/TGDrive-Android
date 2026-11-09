@@ -23,7 +23,7 @@ class SettingsStore(private val context: Context) {
         val onboarded = booleanPreferencesKey("onboarded")
         val concurrency = intPreferencesKey("download_concurrency")
         val cacheCapGb = intPreferencesKey("cache_cap_gb")
-        val proxyKind = stringPreferencesKey("proxy_kind")           // none|mtproto|socks5
+        val proxyKind = stringPreferencesKey("proxy_kind")           // none|mtproto|socks5|system
         val proxyServer = stringPreferencesKey("proxy_server")
         val proxyPort = intPreferencesKey("proxy_port")
         val proxySecret = stringPreferencesKey("proxy_secret")
@@ -70,6 +70,7 @@ class SettingsStore(private val context: Context) {
                 p[K.proxyPort] ?: 1080,
                 p[K.proxyUser], p[K.proxyPass]
             )
+            "system" -> ProxySnapshot.System
             else -> null
         }
     }
@@ -92,6 +93,15 @@ class SettingsStore(private val context: Context) {
                     p[K.proxyUser] = snapshot.user ?: ""
                     p[K.proxyPass] = snapshot.pass ?: ""
                 }
+                is ProxySnapshot.System -> {
+                    p[K.proxyKind] = "system"
+                    // 系统代理无静态地址：清掉旧配置残留，避免下次切回手填模式时回填脏值
+                    p.remove(K.proxyServer)
+                    p.remove(K.proxyPort)
+                    p.remove(K.proxySecret)
+                    p.remove(K.proxyUser)
+                    p.remove(K.proxyPass)
+                }
             }
         }
     }
@@ -101,13 +111,28 @@ sealed interface ProxySnapshot {
     data class Mt(val server: String, val port: Int, val secret: String) : ProxySnapshot
     data class Socks(val server: String, val port: Int, val user: String?, val pass: String?) : ProxySnapshot
 
-    fun toConfig(): ProxyConfig = when (this) {
+    /** 「跟随系统代理」：真实配置在运行时由 [com.yg.tgdrive.td.SystemProxyResolver] 探测。 */
+    data object System : ProxySnapshot
+
+    /**
+     * 无法在此解析 [System]（需要 Context 才能读 ConnectivityManager），故返回 null。
+     * 冷启动/登录链路一律走 [com.yg.tgdrive.td.TdProxyManager.applySnapshot]，
+     * 由它把 System 解析成 [ProxyConfig.Http]，探测失败时退化为直连。
+     */
+    fun toConfig(): ProxyConfig? = when (this) {
         is Mt -> ProxyConfig.MtProto(server, port, secret)
         is Socks -> ProxyConfig.Socks5(server, port, user, pass)
+        is System -> null
     }
 
     fun toJson(): String = Json.encodeToString(
         kotlinx.serialization.serializer(),
-        mapOf("kind" to when (this) { is Mt -> "mtproto"; is Socks -> "socks5" })
+        mapOf(
+            "kind" to when (this) {
+                is Mt -> "mtproto"
+                is Socks -> "socks5"
+                is System -> "system"
+            }
+        )
     )
 }

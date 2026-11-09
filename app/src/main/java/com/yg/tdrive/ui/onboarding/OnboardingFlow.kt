@@ -158,8 +158,9 @@ private fun ProxyStep(onDone: () -> Unit, onSkip: () -> Unit) {
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         ProxyEditor(
-            initialMode = ProxyMode.Skip,
+            initialMode = ProxyMode.Direct,
             onSaved = { onDone() },
+            isOnboarding = true,
         )
         Spacer(Modifier.height(8.dp))
         OutlinedButton(onClick = onSkip, modifier = Modifier.fillMaxWidth()) {
