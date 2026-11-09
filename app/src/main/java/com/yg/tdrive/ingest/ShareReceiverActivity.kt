@@ -1,0 +1,102 @@
+package com.yg.tgdrive.ingest
+
+import android.app.AlertDialog
+import android.content.Intent
+import android.net.Uri
+import android.os.Bundle
+import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.core.content.IntentCompat
+import androidx.lifecycle.lifecycleScope
+import com.yg.tgdrive.ServiceLocator
+import com.yg.tgdrive.data.DriveEntity
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+
+/**
+ * Share sheet 入库接收页（SPEC §4.6 辅路径）。
+ *
+ * manifest 已注册：ACTION_SEND / ACTION_SEND_MULTIPLE，mimeType video/mp4 与 image/jpeg 等，
+ * exported=true，主题 @style/Theme.TGDrive.Dialog（framework Material dialog 主题，
+ * 因此这里用 android.app.AlertDialog，不引 appcompat）。
+ *
+ * 流程：提取分享 Uri → 从 ServiceLocator.driveManager.observeDrives 取驱动器列表
+ * → 弹选择对话框 → 选中后接 M4 上传链路。
+ * M0 现状：M4 占位 —— 选中后仅 Toast「入库功能 M4 实现」并 finish()。
+ */
+class ShareReceiverActivity : ComponentActivity() {
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        val uris: List<Uri> = extractUris(intent)
+        if (uris.isEmpty()) {
+            Toast.makeText(this, "未收到可入库的视频/图片", Toast.LENGTH_SHORT).show()
+            finish()
+            return
+        }
+
+        // observeDrives 返回 Room Flow（驱动器表实时数据）；此处取当前快照弹出选择器
+        lifecycleScope.launch {
+            val drives: List<DriveEntity> = try {
+                ServiceLocator.driveManager.observeDrives().first()
+            } catch (t: Throwable) {
+                Toast.makeText(this@ShareReceiverActivity, "读取驱动器失败：${t.message}", Toast.LENGTH_SHORT).show()
+                finish()
+                return@launch
+            }
+
+            if (drives.isEmpty()) {
+                Toast.makeText(this@ShareReceiverActivity, "尚无驱动器，请先在 App 内勾选频道", Toast.LENGTH_LONG).show()
+                finish()
+                return@launch
+            }
+
+            val titles = drives.map { it.title }.toTypedArray()
+            AlertDialog.Builder(this@ShareReceiverActivity)
+                .setTitle("分享入库到驱动器（${uris.size} 个文件）")
+                .setItems(titles) { _, which -> handleSelected(drives[which], uris) }
+                .setNegativeButton("取消") { _, _ -> finish() }
+                .setOnCancelListener { finish() }
+                .show()
+        }
+    }
+
+    /**
+     * 选中驱动器后的处理 —— M4 在此接入真实上传链路。
+     * 假设签名（以 data 包 agent 产出为准，lead 集成时对齐）：
+     *   DriveItem: val id: Long / val chatId: Long / val title: String
+     */
+    private fun handleSelected(drive: DriveEntity, uris: List<Uri>) {
+        // TODO(M4): 上传路径（SPEC §4.6 / §6）：
+        //   1. SAF Uri 无真实路径 → 先拷贝到 cacheDir/incoming/ 临时文件（io dispatcher）
+        //   2. td.call(sendMessage(chat_id, inputMessageDocument(inputFileLocal(tmpPath))))
+        //      （图片可选 inputMessagePhoto；mime 以 video/ 开头走 document 保原始文件名）
+        //   3. 进度：订阅 TdClient.fileUpdates 过滤该 file 的 updateFile.uploaded_size
+        //      → 前台通知条（上传并发 ≤ 2，SPEC §7）
+        //   4. 入口：IngestReceiver.onShared(uris, driveId): Deferred<List<UploadState>>
+        Toast.makeText(this, "入库功能 M4 实现", Toast.LENGTH_SHORT).show()
+        finish()
+    }
+
+    /** 从 ACTION_SEND、ACTION_SEND_MULTIPLE 提取 Uri 列表（clipData 兜底兼容厂商 ROM）。 */
+    private fun extractUris(intent: Intent?): List<Uri> {
+        if (intent == null) return emptyList()
+        val fromExtra: List<Uri> = when (intent.action) {
+            Intent.ACTION_SEND -> listOfNotNull(
+                IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
+            )
+            Intent.ACTION_SEND_MULTIPLE ->
+                IntentCompat.getParcelableArrayListExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
+                    ?.filterNotNull()
+                    ?: emptyList()
+            else -> emptyList()
+        }
+        if (fromExtra.isNotEmpty()) return fromExtra
+        // 兜底：部分厂商分享把内容放 clipData
+        val clip = intent.clipData ?: return emptyList()
+        return (0 until clip.itemCount).mapNotNull { clip.getItemAt(it).uri }
+    }
+}
+
+
