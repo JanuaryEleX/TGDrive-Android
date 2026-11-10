@@ -369,15 +369,18 @@ class MediaRepository(
 
         when (contentType) {
             "messageVideo" -> {
+                // TDLib video 类型：文件字段名是 video_file（非 file）；无 file_name 字段；
+                // 缩略图在 thumbnails:vector<photoSize>（photoSize.photo = file 对象）
                 val video = content["video"] as? JsonObject ?: return null
-                fileObj = video["file"] as? JsonObject ?: return null
+                fileObj = (video["video_file"] as? JsonObject
+                    ?: video["file"] as? JsonObject) ?: return null
                 kind = MediaKind.VIDEO
                 mime = (video["mime_type"] as? JsonPrimitive)?.content
                 displayName = (video["file_name"] as? JsonPrimitive)?.content ?: ""
                 durationMs = video["duration"]?.jsonPrimitive?.longOrNull?.times(1000)
                 width = video["width"]?.jsonPrimitive?.longOrNull?.toInt()
                 height = video["height"]?.jsonPrimitive?.longOrNull?.toInt()
-                thumbFile = video["thumbnail"]?.jsonObject?.get("file") as? JsonObject
+                thumbFile = smallestThumb(video["thumbnails"] as? JsonArray)
             }
             "messagePhoto" -> {
                 val photo = content["photo"] as? JsonObject ?: return null
@@ -397,9 +400,23 @@ class MediaRepository(
                 val isVideo = mime?.startsWith("video/") == true ||
                     displayName.substringAfterLast('.', "").lowercase(Locale.US) in VIDEO_EXTENSIONS
                 if (!isVideo) return null
-                fileObj = doc["document"] as? JsonObject ?: return null
+                // TDLib document 类型：文件字段名是 document_file（非 document）
+                fileObj = (doc["document_file"] as? JsonObject
+                    ?: doc["document"] as? JsonObject) ?: return null
                 kind = MediaKind.VIDEO
-                thumbFile = doc["thumbnail"]?.jsonObject?.get("file") as? JsonObject
+                thumbFile = smallestThumb(doc["thumbnails"] as? JsonArray)
+            }
+            "messageAnimation" -> {
+                // GIF/无声视频（TDLib animation 类型），按视频入库（多为 mp4/gif 可播）
+                val anim = content["animation"] as? JsonObject ?: return null
+                fileObj = (anim["animation_file"] as? JsonObject) ?: return null
+                kind = MediaKind.VIDEO
+                mime = (anim["mime_type"] as? JsonPrimitive)?.content
+                displayName = (anim["file_name"] as? JsonPrimitive)?.content ?: ""
+                durationMs = anim["duration"]?.jsonPrimitive?.longOrNull?.times(1000)
+                width = anim["width"]?.jsonPrimitive?.longOrNull?.toInt()
+                height = anim["height"]?.jsonPrimitive?.longOrNull?.toInt()
+                thumbFile = smallestThumb(anim["thumbnails"] as? JsonArray)
             }
             else -> return null
         }
@@ -547,12 +564,24 @@ class MediaRepository(
         private fun extractFileObject(msg: JsonObject): JsonObject? {
             val content = msg["content"] as? JsonObject ?: return null
             return when ((content["@type"] as? JsonPrimitive)?.content) {
-                "messageVideo" -> content["video"]?.jsonObject?.get("file") as? JsonObject
+                "messageVideo" -> content["video"]?.jsonObject?.get("video_file") as? JsonObject
+                    ?: content["video"]?.jsonObject?.get("file") as? JsonObject
                 "messagePhoto" -> content["photo"]?.jsonObject?.let { photoMainFile(it) }
-                "messageDocument" -> content["document"]?.jsonObject?.get("document") as? JsonObject
+                "messageDocument" -> content["document"]?.jsonObject?.get("document_file") as? JsonObject
+                    ?: content["document"]?.jsonObject?.get("document") as? JsonObject
+                "messageAnimation" -> content["animation"]?.jsonObject?.get("animation_file") as? JsonObject
                 else -> null
             }
         }
+
+        /** video/document/animation 的 thumbnails 数组里取最小 photoSize 的 photo（file 对象）。 */
+        private fun smallestThumb(thumbnails: JsonArray?): JsonObject? =
+            thumbnails?.mapNotNull { it as? JsonObject }
+                ?.minByOrNull { s ->
+                    (s["width"]?.jsonPrimitive?.longOrNull ?: 0L) *
+                        (s["height"]?.jsonPrimitive?.longOrNull ?: 0L)
+                }
+                ?.get("photo") as? JsonObject
 
         /** photo.sizes 里最大的 photoSize 的 photo 字段（媒体主文件：file_id/remote/大小来源）。 */
         private fun photoMainFile(photo: JsonObject): JsonObject? =
