@@ -109,4 +109,12 @@ interface MediaDao {
     /** M4 stale 清理：删除某驱动器内全部失效行。 */
     @Query("DELETE FROM media WHERE drive_id = :driveId AND stale = 1")
     suspend fun deleteStaleByDrive(driveId: Long)
+
+    /** 缺封面行计数（诊断/补抓用）。 */
+    @Query("SELECT COUNT(*) FROM media WHERE drive_id = :driveId AND thumb_path IS NULL")
+    suspend fun countMissingThumb(driveId: Long): Int
+
+    /** 清空某驱动器内缺封面行的 thumb_path，让下一轮扫描重新补抓。 */
+    @Query("UPDATE media SET thumb_path = NULL WHERE drive_id = :driveId AND thumb_path IS NULL")
+    suspend fun noopClearMissingThumb(driveId: Long)
 }

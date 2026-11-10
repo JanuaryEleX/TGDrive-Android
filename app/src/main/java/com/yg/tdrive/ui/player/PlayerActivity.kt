@@ -195,9 +195,24 @@ class PlayerActivity : ComponentActivity() {
         val mediaItem = MediaItem.Builder()
             .setUri(TdDataSource.buildUri(fileId, entity.size, entity.fileUniqueId))
             .build()
-        val source = ProgressiveMediaSource.Factory(
+        // moov 在文件尾的 MP4：先做 faststart 虚拟重排（IO 线程，避免主线程等待下载）。
+        // 否则 Mp4Extractor 会 seek 到尾部读 moov，并把采样偏移按尾部基准二次叠加，
+        // 得到 > 文件长度的位置后越界 EOF（Loading finished before preparation）。
+        val plan = if (entity.size > 0L) {
+            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                com.yg.tgdrive.download.FaststartRemuxer.build(
+                    ServiceLocator.downloadManager, fileId, entity.size
+                )
+            }
+        } else {
+            null
+        }
+        val factory: androidx.media3.datasource.DataSource.Factory = if (plan != null) {
+            com.yg.tgdrive.download.TdVirtualDataSourceFactory(ServiceLocator.downloadManager, plan)
+        } else {
             TdDataSourceFactory(ServiceLocator.downloadManager)
-        ).createMediaSource(mediaItem)
+        }
+        val source = ProgressiveMediaSource.Factory(factory).createMediaSource(mediaItem)
         p.setMediaSource(source)
 
         var resumeMs = 0L

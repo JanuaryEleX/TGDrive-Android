@@ -96,7 +96,8 @@ class TdClient {
         // TDLib 1.8.x 校验 system_language_code 非空（模拟器系统 locale 可能为空 → 400
         // "System language code must be non-empty"）——显式传并兜底非空。
         val lang = java.util.Locale.getDefault().language?.takeIf { it.isNotBlank() } ?: "en"
-        call(tdObj(
+        try {
+            call(tdObj(
             "@type" to "setTdlibParameters",
             "api_id" to apiId,
             "api_hash" to apiHash,
@@ -111,7 +112,12 @@ class TdClient {
             "use_message_database" to true,
             "use_secret_chats" to false,
             "enable_storage_optimizer" to true,
-        ))
+            ))
+        } catch (t: Throwable) {
+            // 失败回滚标记：否则 initialized 永久为 true，任何重试都被挡掉 → 永远卡 Loading
+            initialized.set(false)
+            throw t
+        }
     }
 
     /** 登录链路：手机号 → 验证码 → 2FA。 */

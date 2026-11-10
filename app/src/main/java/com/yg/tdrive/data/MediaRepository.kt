@@ -30,6 +30,8 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
 import java.io.File
 import java.util.Locale
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 
 /** UI/上层消费的媒体条目（SPEC §6 MediaItem 语义；字段即 MediaEntity）。 */
 typealias MediaItem = MediaEntity
@@ -54,6 +56,19 @@ typealias MediaItem = MediaEntity
  * 【假设】缩略图等扫描外异步作业挂在内部 CoroutineScope(SupervisorJob()+IO) 上，
  * 不随单次扫描协程取消 —— ServiceLocator.appScope 未随构造注入，避免改契约签名。
  */
+/** 扫描进度快照（主页顶部进度条订阅；仅内存态，不落库）。 */
+data class ScanProgress(
+    val driveId: Long = -1L,
+    /** 是否正在扫描。 */
+    val running: Boolean = false,
+    /** 已遍历消息数。 */
+    val scanned: Int = 0,
+    /** 本次新入库媒体数。 */
+    val inserted: Int = 0,
+    /** 阶段性提示（等待历史下发 / 完成）。 */
+    val phase: String = "",
+)
+
 class MediaRepository(
     private val db: AppDatabase,
     private val td: TdClient,
@@ -69,6 +84,16 @@ class MediaRepository(
     /** 缩略图下载并发上限（priority=2 小文件，4 路足够，SPEC §7 速率约束之内）。 */
     private val thumbSemaphore = Semaphore(4)
 
+
+    // ── 扫描进度：UI 顶部进度条订阅（主页/设置页共用） ──
+    private val _scanProgress = MutableStateFlow(ScanProgress())
+    /** 当前扫描进度；running=false 时 scanned/inserted 保留本轮结果供 UI 展示。 */
+    val scanProgress: StateFlow<ScanProgress> = _scanProgress
+
+    private fun publishProgress(p: ScanProgress) {
+        _scanProgress.value = p
+    }
+
     // ═══════════════════════ 扫描 ═══════════════════════
 
     /**
@@ -79,6 +104,11 @@ class MediaRepository(
     suspend fun fullScan(driveId: Long) {
         val drive = driveDao.getById(driveId) ?: return
         driveDao.setScanState(driveId, ScanState.SCANNING)
+        var scanned = 0
+        var inserted = 0
+        var emptyRetries = 0
+        var shortRetries = 0
+        publishProgress(ScanProgress(driveId = driveId, running = true))
         try {
             val chatId = drive.chatId
             var newestId = 0L
@@ -96,24 +126,63 @@ class MediaRepository(
                 )
                 val messages = resp["messages"]?.jsonArray
                     ?.mapNotNull { it as? JsonObject } ?: emptyList()
-                if (messages.isEmpty()) break
+                if (messages.isEmpty()) {
+                    // TDLib 历史尚未落盘时会先返回空页。直接 break 曾把 last_scanned 写成
+                    // 最新 id，导致之后所有增量同步被幂等短路 → 永远空库。
+                    if (emptyRetries < EMPTY_PAGE_RETRIES) {
+                        emptyRetries++
+                        publishProgress(
+                            ScanProgress(driveId, true, scanned, inserted, "等待 Telegram 下发历史…")
+                        )
+                        delay(EMPTY_PAGE_DELAY_MS)
+                        continue
+                    }
+                    // 重试耗尽：视为本轮未扫完，标记 ERROR 而非 DONE，
+                    // 避免 last_scanned 被写成最新 id 后增量同步永久幂等短路
+                    throw IllegalStateException(
+                        "历史未就绪：连续 $EMPTY_PAGE_RETRIES 次空页，本轮中止（可重扫重试）"
+                    )
+                }
+                emptyRetries = 0
 
                 if (newestId == 0L) {
                     newestId = messages.first()["id"]?.jsonPrimitive?.longOrNull ?: 0L
                 }
-                ingestPage(chatId, driveId, messages)
+                scanned += messages.size
+                inserted += ingestPage(chatId, driveId, messages)
+                publishProgress(ScanProgress(driveId, true, scanned, inserted))
 
                 val lastId = messages.last()["id"]?.jsonPrimitive?.longOrNull ?: 0L
-                if (messages.size < SCAN_PAGE_SIZE || lastId == 0L) break   // 到头部
+                if (lastId == 0L) break
+                // 不足一页不一定是到头：TDLib 只返回已缓存部分，中间段还没拉下来。
+                // 关键：短页时**不推进** fromMessageId，原地重试，否则会永久跳过未缓存区段。
+                if (messages.size < SCAN_PAGE_SIZE) {
+                    shortRetries++
+                    if (shortRetries > SHORT_PAGE_RETRIES) break
+                    publishProgress(
+                        ScanProgress(driveId, true, scanned, inserted, "等待更早的历史…")
+                    )
+                    delay(SHORT_PAGE_DELAY_MS)
+                    continue
+                }
+                shortRetries = 0
                 fromMessageId = lastId
                 delay(PAGE_DELAY_MS)
             }
             mediaDao.deleteStaleByDrive(driveId)
+            // 已入库但缺封面的行（字段名修正前写入的旧数据）无法从消息重取，
+            // 这里仅统计，实际补抓由下一轮 parseMedia 自然完成。
+            val missing = mediaDao.countMissingThumb(driveId)
+            if (missing > 0) Log.w(TAG, "drive=$driveId 仍有 $missing 条缺封面")
             driveDao.setLastScannedMessageId(driveId, newestId)
             driveDao.setScanState(driveId, ScanState.DONE)
         } catch (t: Throwable) {
             Log.e(TAG, "fullScan drive=$driveId failed", t)
             driveDao.setScanState(driveId, ScanState.ERROR)
+        } finally {
+            publishProgress(
+                ScanProgress(driveId, false, scanned, inserted, if (inserted > 0) "完成" else "")
+            )
         }
     }
 
@@ -124,6 +193,11 @@ class MediaRepository(
     suspend fun incrementalSync(driveId: Long) {
         val drive = driveDao.getById(driveId) ?: return
         driveDao.setScanState(driveId, ScanState.SCANNING)
+        var scanned = 0
+        var inserted = 0
+        var emptyRetries = 0
+        var shortRetries = 0
+        publishProgress(ScanProgress(driveId = driveId, running = true))
         try {
             val chatId = drive.chatId
             val stopId = drive.lastScannedMessageId
@@ -152,7 +226,23 @@ class MediaRepository(
                 )
                 val messages = resp["messages"]?.jsonArray
                     ?.mapNotNull { it as? JsonObject } ?: emptyList()
-                if (messages.isEmpty()) break
+                if (messages.isEmpty()) {
+                    // 同 fullScan：历史未落盘的空页要重试，不能当作扫完
+                    if (emptyRetries < EMPTY_PAGE_RETRIES) {
+                        emptyRetries++
+                        publishProgress(
+                            ScanProgress(driveId, true, scanned, inserted, "等待 Telegram 下发历史…")
+                        )
+                        delay(EMPTY_PAGE_DELAY_MS)
+                        continue
+                    }
+                    // 重试耗尽：视为本轮未扫完，标记 ERROR 而非 DONE，
+                    // 避免 last_scanned 被写成最新 id 后增量同步永久幂等短路
+                    throw IllegalStateException(
+                        "历史未就绪：连续 $EMPTY_PAGE_RETRIES 次空页，本轮中止（可重扫重试）"
+                    )
+                }
+                emptyRetries = 0
 
                 val stopHere = messages.any {
                     (it["id"]?.jsonPrimitive?.longOrNull ?: 0L) <= stopId
@@ -160,10 +250,19 @@ class MediaRepository(
                 val fresh = messages.filter {
                     (it["id"]?.jsonPrimitive?.longOrNull ?: 0L) > stopId
                 }
-                if (fresh.isNotEmpty()) ingestPage(chatId, driveId, fresh)
+                scanned += messages.size
+                if (fresh.isNotEmpty()) inserted += ingestPage(chatId, driveId, fresh)
+                publishProgress(ScanProgress(driveId, true, scanned, inserted))
 
                 if (stopHere) break
                 val lastId = messages.last()["id"]?.jsonPrimitive?.longOrNull ?: break
+                if (messages.size < SCAN_PAGE_SIZE) {
+                    shortRetries++
+                    if (shortRetries > SHORT_PAGE_RETRIES) break
+                    delay(SHORT_PAGE_DELAY_MS)
+                    continue
+                }
+                shortRetries = 0
                 fromMessageId = lastId
                 delay(PAGE_DELAY_MS)
             }
@@ -172,19 +271,24 @@ class MediaRepository(
         } catch (t: Throwable) {
             Log.e(TAG, "incrementalSync drive=$driveId failed", t)
             driveDao.setScanState(driveId, ScanState.ERROR)
+        } finally {
+            publishProgress(
+                ScanProgress(driveId, false, scanned, inserted, if (inserted > 0) "完成" else "")
+            )
         }
     }
 
     /** 单页入库：解析 → IGNORE 幂等插入（回读 rowId）→ 异步补抓缩略图。 */
-    private suspend fun ingestPage(chatId: Long, driveId: Long, messages: List<JsonObject>) {
+    private suspend fun ingestPage(chatId: Long, driveId: Long, messages: List<JsonObject>): Int {
         val parsed = messages.mapNotNull { parseMedia(chatId, driveId, it) }
-        if (parsed.isEmpty()) return
+        if (parsed.isEmpty()) return 0
         val entities = parsed.map { it.first }
         val rowIds = withContext(Dispatchers.IO) { mediaDao.insertAllIgnoring(entities) }
         parsed.zip(rowIds) { (entity, thumb), rowId ->
             // rowId == -1L：已存在的行（重扫），保留其本地覆盖（display_name/thumb_path），跳过缩略图
             if (rowId != -1L) launchThumbJob(entity.copy(id = rowId), thumb)
         }
+        return rowIds.count { it != -1L }
     }
 
     // ═══════════════════════ 观察流 ═══════════════════════
@@ -372,7 +476,10 @@ class MediaRepository(
                 // TDLib video 类型：文件字段名是 video_file（非 file）；无 file_name 字段；
                 // 缩略图在 thumbnails:vector<photoSize>（photoSize.photo = file 对象）
                 val video = content["video"] as? JsonObject ?: return null
-                fileObj = (video["video_file"] as? JsonObject
+                // 实测 tdjson 1.8.65：video 对象的文件字段就是 "video"，
+                // 旧版/文档中的 video_file 并不存在；兼容三者以防版本差异。
+                fileObj = (video["video"] as? JsonObject
+                    ?: video["video_file"] as? JsonObject
                     ?: video["file"] as? JsonObject) ?: return null
                 kind = MediaKind.VIDEO
                 mime = (video["mime_type"] as? JsonPrimitive)?.content
@@ -380,7 +487,8 @@ class MediaRepository(
                 durationMs = video["duration"]?.jsonPrimitive?.longOrNull?.times(1000)
                 width = video["width"]?.jsonPrimitive?.longOrNull?.toInt()
                 height = video["height"]?.jsonPrimitive?.longOrNull?.toInt()
-                thumbFile = smallestThumb(video["thumbnails"] as? JsonArray)
+                thumbFile = singleThumb(video["thumbnail"] as? JsonObject)
+                    ?: smallestThumb(video["thumbnails"] as? JsonArray)
             }
             "messagePhoto" -> {
                 val photo = content["photo"] as? JsonObject ?: return null
@@ -401,22 +509,25 @@ class MediaRepository(
                     displayName.substringAfterLast('.', "").lowercase(Locale.US) in VIDEO_EXTENSIONS
                 if (!isVideo) return null
                 // TDLib document 类型：文件字段名是 document_file（非 document）
-                fileObj = (doc["document_file"] as? JsonObject
-                    ?: doc["document"] as? JsonObject) ?: return null
+                fileObj = (doc["document"] as? JsonObject
+                    ?: doc["document_file"] as? JsonObject) ?: return null
                 kind = MediaKind.VIDEO
-                thumbFile = smallestThumb(doc["thumbnails"] as? JsonArray)
+                thumbFile = singleThumb(doc["thumbnail"] as? JsonObject)
+                    ?: smallestThumb(doc["thumbnails"] as? JsonArray)
             }
             "messageAnimation" -> {
                 // GIF/无声视频（TDLib animation 类型），按视频入库（多为 mp4/gif 可播）
                 val anim = content["animation"] as? JsonObject ?: return null
-                fileObj = (anim["animation_file"] as? JsonObject) ?: return null
+                fileObj = (anim["animation"] as? JsonObject
+                    ?: anim["animation_file"] as? JsonObject) ?: return null
                 kind = MediaKind.VIDEO
                 mime = (anim["mime_type"] as? JsonPrimitive)?.content
                 displayName = (anim["file_name"] as? JsonPrimitive)?.content ?: ""
                 durationMs = anim["duration"]?.jsonPrimitive?.longOrNull?.times(1000)
                 width = anim["width"]?.jsonPrimitive?.longOrNull?.toInt()
                 height = anim["height"]?.jsonPrimitive?.longOrNull?.toInt()
-                thumbFile = smallestThumb(anim["thumbnails"] as? JsonArray)
+                thumbFile = singleThumb(anim["thumbnail"] as? JsonObject)
+                    ?: smallestThumb(anim["thumbnails"] as? JsonArray)
             }
             else -> return null
         }
@@ -555,6 +666,15 @@ class MediaRepository(
         private const val THUMB_TIMEOUT_MS = 20_000L
         private const val DELETE_RECEIPT_TIMEOUT_MS = 30_000L
 
+        /** 空页重试上限：TDLib 刚登录/重启时历史未落盘，getChatHistory 会先返回空。 */
+        /** 短页重试上限：TDLib 返回不足一页并不代表到头，只是服务端历史还没拉够。 */
+        private const val SHORT_PAGE_RETRIES = 30
+        private const val EMPTY_PAGE_RETRIES = 30
+        /** 空页重试间隔（给 TDLib 后台拉历史的时间）。 */
+        private const val EMPTY_PAGE_DELAY_MS = 2_000L
+        /** 短页重试间隔：给 TDLib 从服务端拉更早历史的时间。 */
+        private const val SHORT_PAGE_DELAY_MS = 2_500L
+
         private val VIDEO_EXTENSIONS = setOf("mp4", "mkv", "avi", "mov", "webm", "ts", "m4v")
 
         private fun longJsonArray(vararg values: Long) =
@@ -564,17 +684,40 @@ class MediaRepository(
         private fun extractFileObject(msg: JsonObject): JsonObject? {
             val content = msg["content"] as? JsonObject ?: return null
             return when ((content["@type"] as? JsonPrimitive)?.content) {
-                "messageVideo" -> content["video"]?.jsonObject?.get("video_file") as? JsonObject
-                    ?: content["video"]?.jsonObject?.get("file") as? JsonObject
+                // 实测 tdjson 1.8.65 的文件字段名就是类型名本身：
+                // video.video / document.document / animation.animation
+                // （旧版 video_file/document_file/animation_file 一并兼容）
+                "messageVideo" -> content["video"]?.jsonObject?.let { v ->
+                    (v["video"] as? JsonObject)
+                        ?: (v["video_file"] as? JsonObject)
+                        ?: (v["file"] as? JsonObject)
+                }
                 "messagePhoto" -> content["photo"]?.jsonObject?.let { photoMainFile(it) }
-                "messageDocument" -> content["document"]?.jsonObject?.get("document_file") as? JsonObject
-                    ?: content["document"]?.jsonObject?.get("document") as? JsonObject
-                "messageAnimation" -> content["animation"]?.jsonObject?.get("animation_file") as? JsonObject
+                "messageDocument" -> content["document"]?.jsonObject?.let { d ->
+                    (d["document"] as? JsonObject)
+                        ?: (d["document_file"] as? JsonObject)
+                }
+                "messageAnimation" -> content["animation"]?.jsonObject?.let { a ->
+                    (a["animation"] as? JsonObject)
+                        ?: (a["animation_file"] as? JsonObject)
+                }
                 else -> null
             }
         }
 
         /** video/document/animation 的 thumbnails 数组里取最小 photoSize 的 photo（file 对象）。 */
+        /**
+         * 单个缩略图对象 → 真正的 file 对象。两种 TDLib 形状都要兼容：
+         *  - thumbnail  (video/document/animation)：file 字段
+         *  - photoSize  (photo.sizes)：photo 字段
+         */
+        private fun singleThumb(ps: JsonObject?): JsonObject? {
+            if (ps == null) return null
+            (ps["file"] as? JsonObject)?.let { return it }
+            (ps["photo"] as? JsonObject)?.let { return it }
+            return null
+        }
+
         private fun smallestThumb(thumbnails: JsonArray?): JsonObject? =
             thumbnails?.mapNotNull { it as? JsonObject }
                 ?.minByOrNull { s ->

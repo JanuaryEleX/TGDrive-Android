@@ -132,8 +132,9 @@ object ServiceLocator {
             // 设置页"清空缓存"：缩略图目录由 MediaRepository 清，LRU 缓存经钩子委托下载层
             mediaRepository.clearCacheHook = { downloadManager.clearCache() }
             // 设置页"重扫"：DriveManager 桥接到 MediaRepository.incrementalSync
+            // 设置页"重扫"走全量：增量会被 last_scanned 幂等短路，无法修复空库
             driveManager.rescanBridge = { driveId ->
-                appScope.launch { mediaRepository.incrementalSync(driveId) }
+                appScope.launch { mediaRepository.fullScan(driveId) }
             }
 
             initialized = true

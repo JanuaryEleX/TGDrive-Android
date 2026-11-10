@@ -2,6 +2,7 @@ package com.yg.tgdrive.td
 
 import android.content.Context
 import com.yg.tgdrive.settings.ProxySnapshot
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * 代理管理：持有当前生效配置并负责 addProxy/pingProxy。
@@ -41,35 +42,50 @@ class TdProxyManager(private val td: TdClient) {
         }
     }
 
-    /** 添加并启用代理；proxy == null 时禁用全部（直连）。 */
+    /**
+     * 添加并启用代理；proxy == null 时禁用全部（直连）。
+     *
+     * 全部请求都包超时：TDLib 在收到 setTdlibParameters 之前可能不应答 addProxy，
+     * 无超时的 await 会永久挂起并堵死调用方协程（曾导致冷启动永远停在"正在连接"）。
+     */
     suspend fun apply(proxy: ProxyConfig?) {
         current = proxy
-        if (proxy == null) {
-            td.call(tdObj("@type" to "disableProxy"))
-            return
+        withTimeoutOrNull(PROXY_CALL_TIMEOUT_MS) {
+            if (proxy == null) {
+                td.call(tdObj("@type" to "disableProxy"))
+            } else {
+                td.call(
+                    tdObj(
+                        "@type" to "addProxy",
+                        "proxy" to proxy.toTdProxy(),
+                        "enable" to true,
+                        "comment" to "",
+                    )
+                )
+            }
         }
-        td.call(
-            tdObj(
-                "@type" to "addProxy",
-                "proxy" to proxy.toTdProxy(),
-                "enable" to true,
-                "comment" to "",
-            )
-        )
     }
 
-    /** 经代理 ping 主 DC，返回延迟 ms；失败返回 null。 */
+    /** 经代理 ping 主 DC，返回延迟 ms；失败/超时返回 null。 */
     suspend fun test(proxy: ProxyConfig): Long? = try {
-        val r = td.call(
-            tdObj(
-                "@type" to "pingProxy",
-                "proxy" to proxy.toTdProxy(),
+        val r = withTimeoutOrNull(PROXY_CALL_TIMEOUT_MS) {
+            td.call(
+                tdObj(
+                    "@type" to "pingProxy",
+                    "proxy" to proxy.toTdProxy(),
+                )
             )
-        )
-        (r["seconds"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toDoubleOrNull()
+        }
+        (r?.get("seconds") as? kotlinx.serialization.json.JsonPrimitive)?.content
+            ?.toDoubleOrNull()
             ?.takeIf { it >= 0 }
             ?.let { (it * 1000).toLong() }
     } catch (t: Throwable) {
         null
+    }
+
+    private companion object {
+        /** 代理类请求的等待上限；超时即放弃（冷启动不应被代理阻塞）。 */
+        const val PROXY_CALL_TIMEOUT_MS = 20_000L
     }
 }

@@ -79,6 +79,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
+import androidx.compose.material3.LinearProgressIndicator
 
 /**
  * 主页：BottomNav 2 tab（海报墙 / 图片）+ 设置入口（SPEC §4.5）。
@@ -125,6 +126,29 @@ fun MainScreen(onOpenSettings: () -> Unit) {
                     contentDescription = "设置",
                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+            }
+        }
+
+        // 扫描进度：扫描中显示进度条 + 已扫/入库计数（TDLib 翻页阶段无百分比，用流式指示）
+        val scan by ServiceLocator.mediaRepository.scanProgress.collectAsState()
+        if (scan.running) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp),
+            ) {
+                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    buildString {
+                        if (scan.scanned == 0 && scan.phase.isNotBlank()) append(scan.phase)
+                        else append("正在扫描")
+                        if (scan.scanned > 0) append("：已扫 ${scan.scanned} 条 · 入库 ${scan.inserted}")
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+                Spacer(Modifier.height(8.dp))
             }
         }
 

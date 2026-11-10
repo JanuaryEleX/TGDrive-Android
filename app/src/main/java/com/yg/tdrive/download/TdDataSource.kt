@@ -1,6 +1,7 @@
 package com.yg.tgdrive.download
 
 import android.net.Uri
+import android.util.Log
 import androidx.media3.common.C
 import androidx.media3.datasource.BaseDataSource
 import androidx.media3.datasource.DataSpec
@@ -35,8 +36,14 @@ class TdDataSource(
         /** read 缓冲上限（Media3 单次 read 请求通常 ≤ 64KB）。 */
         private const val MAX_READ = 256 * 1024
 
-        /** ensureRange 预热长度（open 起播 / read 跨窗口时先保证 2MB 数据）。 */
-        private const val PREHEAT = 2L * 1024 * 1024
+        /** 空洞重试次数上限（超过则照常读取，交给解码器报错）。 */
+        private const val HOLE_RETRIES = 3
+
+        /** 空洞探针字节数。 */
+        private const val HOLE_PROBE_BYTES = 8
+
+        /** ensureRange 预热长度（open 起播 / read 跨窗口时先保证数据）。 */
+        private const val PREHEAT = 512L * 1024
 
         /** 解析标记 URI → (fileId, size, uid)。非本 scheme 抛 IOException。 */
         fun parseUri(uri: Uri): Triple<Int, Long, String?> {
@@ -65,6 +72,21 @@ class TdDataSource(
                 .build()
     }
 
+    /** 单次 open 的全部状态（并发 open 时互不干扰）。 */
+    private class OpenState(
+        val fileId: Int,
+        val totalSize: Long,
+        var position: Long,
+        var endPosition: Long,
+    ) {
+        var ref: PartialRef? = null
+        var raf: RandomAccessFile? = null
+        var rafPath: String? = null
+        var rafGlobalOffset: Long = -1L
+    }
+
+    @Volatile private var state: OpenState? = null
+
     private var fileId: Int = 0
     private var totalSize: Long = 0L
     private var uid: String? = null
@@ -87,6 +109,8 @@ class TdDataSource(
     private var rafGlobalOffset: Long = -1L
 
     private var opened = false
+
+    private var readCalls = 0
 
     @Volatile private var closed = false
 
@@ -141,7 +165,9 @@ class TdDataSource(
     override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
         check(opened) { "read before open" }
         if (length == 0) return 0
-        if (position >= endPosition) return C.RESULT_END_OF_INPUT
+        if (position >= endPosition) {
+            return C.RESULT_END_OF_INPUT
+        }
 
         var bufOffset = offset
         var remaining = minOf(length.toLong(), endPosition - position).toInt()
@@ -152,7 +178,11 @@ class TdDataSource(
             // 当前位置不在已覆盖区间 → ensureRange 挂起等落盘（read 的挂起点）
             val r = currentRefFor(position, remaining.toLong())
             val handle = openHandle(r)
-            handle.seek(position - r.globalOffset)
+            // PartialRef 指向的是 TDLib 预分配好的"整文件"，其 globalOffset 只是窗口基准，
+            // 不是文件内偏移。只有真正的裁剪窗口文件才需要减去 globalOffset。
+            val refLen = File(r.partialPath).length()
+            val seekPos = if (totalSize > 0L && refLen >= totalSize) position else position - r.globalOffset
+            handle.seek(seekPos)
 
             // 单次读上限：句柄覆盖的文件尾 / 本次请求终点 / 请求长度
             val fileLen = File(r.partialPath).length()
@@ -167,6 +197,9 @@ class TdDataSource(
                 handle.read(buffer, bufOffset, toRead)
             } catch (e: IOException) {
                 throw IOException("partial 读失败 file=$fileId pos=$position: ${e.message}", e)
+            }
+            readCalls++
+            if (readCalls <= 14) {
             }
             if (n <= 0) {
                 if (totalRead == 0) {
@@ -183,8 +216,12 @@ class TdDataSource(
             totalRead += n
         }
 
+        if (totalRead == 0 && want > 0) {
+            return C.RESULT_END_OF_INPUT
+        }
         if (totalRead > 0) bytesTransferred(totalRead)
-        return if (totalRead == 0 && want > 0) C.RESULT_END_OF_INPUT else totalRead
+        if (position >= endPosition) Log.w(TAG, "read reach-end file=$fileId pos=$position")
+        return totalRead
     }
 
     @Throws(IOException::class)
@@ -232,13 +269,28 @@ class TdDataSource(
         }
     }
 
+    /** 该位置磁盘上是否已有真实数据（全 0x00 = TDLib 稀疏文件的空洞）。 */
+    private fun hasRealData(path: String, pos: Long): Boolean = runCatching {
+        RandomAccessFile(path, "r").use { raf ->
+            if (raf.length() <= pos) return@use false
+            raf.seek(pos)
+            val buf = ByteArray(HOLE_PROBE_BYTES)
+            val n = raf.read(buf)
+            n > 0 && buf.take(n).any { it.toInt() != 0 }
+        }
+    }.getOrDefault(false)
+
+    /** ensureRange 的同步引用版本（read 内部空洞重试用）。 */
+    private fun ensureRangeRef(pos: Long, len: Long): PartialRef = try {
+        runBlocking { mgr.ensureRange(fileId, pos, len) }.also { ref = it }
+    } catch (ie: InterruptedException) {
+        Thread.currentThread().interrupt()
+        throw IOException("读取被取消 file=$fileId", ie)
+    }
+
     /** ref 是否已覆盖 pos（覆盖 = pos 落在 [globalOffset, globalOffset+文件实际长度)）。 */
     private fun covers(r: PartialRef, pos: Long): Boolean {
-        val fileLen = if (rafPath == r.partialPath) {
-            runCatching { File(r.partialPath).length() }.getOrDefault(0L)
-        } else {
-            0L
-        }
+        val fileLen = runCatching { File(r.partialPath).length() }.getOrDefault(0L)
         if (fileLen <= 0) return false
         return pos >= r.globalOffset && pos < r.globalOffset + fileLen
     }

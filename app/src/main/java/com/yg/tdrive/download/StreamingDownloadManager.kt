@@ -11,6 +11,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -81,7 +82,25 @@ class StreamingDownloadManager(
         private const val CHUNK_STALL_MS = 30_000L
 
         /** ensureRange 等待器整体超时。 */
-        private const val WAIT_TIMEOUT_MS = 30_000L
+        private const val WAIT_TIMEOUT_MS = 60_000L
+
+        /** 起播最小可读字节：TDLib 逐块落盘，等满 PREHEAT 会白等。 */
+        private const val MIN_READY_BYTES = 256L * 1024
+
+        /** 真实字节探针：读多少字节判定非空洞。 */
+        private const val PROBE_BYTES = 32
+
+        /** 探针轮询间隔。 */
+        private const val PROBE_POLL_MS = 200L
+
+        /** 探针最长等待（超时上抛 → 播放页错误覆盖层）。 */
+        private const val PROBE_TIMEOUT_MS = 90_000L
+
+        /** synchronous downloadFile 拉取非顺序区间的最长等待。 */
+        private const val SYNC_FETCH_TIMEOUT_MS = 180_000L
+
+        /** 判定为"尾部窗口"的距离阈值：距文件尾 ≤ 32MB 时整段同步拉取。 */
+        private const val TAIL_SYNC_WINDOW = 32L * 1024 * 1024
 
         /** 等待轮询间隔 / getFile 快照兜底间隔。 */
         private const val POLL_MS = 50L
@@ -89,7 +108,7 @@ class StreamingDownloadManager(
 
         /** 并发上限（SPEC §7：硬上限 8）。 */
         const val MAX_CONCURRENCY = 8
-        private const val DEFAULT_CONCURRENCY = 4
+        private const val DEFAULT_CONCURRENCY = 1
 
         /** 防串台保险：单条 update/file 快照允许推进 readable 的最大增量（8MB）。 */
         private const val MAX_PREFIX_JUMP = 8L * 1024 * 1024
@@ -146,6 +165,16 @@ class StreamingDownloadManager(
         /** 云端已知文件大小（file.size / expected_size，seek 越界钳制用）。 */
         @Volatile var expectedSize = 0L
 
+        /** TDLib local.downloaded_size：全文件累计已下载字节（任意位置，非前缀）。 */
+        @Volatile var downloadedSize = 0L
+
+        /**
+         * 窗口平移瞬间的 [downloadedSize] 基线。尾部窗口（base>0，MP4 moov 在文件尾）
+         * 的"可读"判据：downloadedSize - tailBaseline ≥ 区间长度。
+         * 前缀判据 [readable] 对尾部永远不成立，必须区分。
+         */
+        @Volatile var tailBaseline = 0L
+
         /** 平移后丢弃旧引用 update 的开关，直到新窗口首个 downloadFile 响应建立基线。 */
         @Volatile var awaitingBaseline = true
 
@@ -178,7 +207,6 @@ class StreamingDownloadManager(
                     val id = (file["id"] as? JsonPrimitive)?.longOrNull?.toInt() ?: return@collect
                     sessions[id]?.let { applyFileState(it, file, establishBaseline = false) }
                 } catch (t: Throwable) {
-                    Log.w(TAG, "fileUpdate dispatch failed", t)
                 }
             }
         }
@@ -209,6 +237,12 @@ class StreamingDownloadManager(
         val aligned = alignDown(offset)
         var endAbs = offset + need
         if (s.expectedSize > 0) endAbs = min(endAbs, s.expectedSize)
+        // 尾部窗口（moov 常在文件尾）：一次等满 [aligned, 文件末尾)，
+        // 否则 moov 被截断，ExoPlayer 准备阶段直接判定"没找到 moov"。
+        // 只有"距离文件尾很近"的窗口才算尾部窗口（moov 场景）。早期实现把任何
+        // aligned>0 都当尾部，导致每次读中段都去同步拉取 [offset, 文件末尾) 几 GB。
+        val nearTail = s.expectedSize > 0L && s.expectedSize - offset <= TAIL_SYNC_WINDOW
+        if (nearTail) endAbs = s.expectedSize
         if (endAbs <= aligned) {
             // 起点越过文件尾（对齐后无有效区间）：返回当前引用，由上层按 EOF 处理
             val path = s.partialPath.value
@@ -220,11 +254,35 @@ class StreamingDownloadManager(
         s.mutex.withLock {
             val keepWindow = s.base >= 0 && aligned >= s.base && aligned <= s.requestedEnd
             if (!keepWindow) shiftWindowLocked(s, aligned)
-            scheduleWindowChunksLocked(s, aligned, max(WINDOW_MIN_AHEAD, need * 2))
+            // 尾部窗口（moov 在文件尾）只走 synchronous 精确拉取，不再铺异步分片：
+            // 两者并存会互相取消 → "td error 200: Canceled by another downloadFile request"，
+            // 该异常一路上抛成 ExoPlayer 的 Loader$UnexpectedLoaderException。
+            if (aligned <= 0L) {
+                scheduleWindowChunksLocked(s, aligned, max(WINDOW_MIN_AHEAD, need * 2))
+            }
         }
 
-        // ⑤ 挂起等待 [offset, endAbs) 落盘（updateFile 驱动 + getFile 快照兜底）
-        awaitReadable(s, endAbs)
+        // ⑤ 尾部窗口（moov 在文件尾）先同步精确拉取 [offset, 文件末尾)，跳过前缀等待；
+        //    头部/中段窗口按 TDLib 逐块落盘等待最小可读窗口。
+        if (nearTail && !s.completed.value) {
+            fetchRangeSync(s, offset, s.expectedSize - offset)
+        } else {
+            val readyTarget = if (s.base > 0L) endAbs else min(endAbs, offset + MIN_READY_BYTES)
+            awaitReadable(s, s.base, readyTarget, endAbs)
+        }
+
+        // ⑥ 真实字节校验：TDLib 预分配稀疏文件，未落地区域读出全 0x00。
+        //    TDLib 自报状态在多窗口并发时会串台，这里以磁盘真实内容为准。
+        // 尾部窗口（moov 在文件尾）：异步 downloadFile 的 offset 只是"优先级提示"，
+        // 实测 TDLib 仍按自己的游标从 0 顺序下（prefix 涨、尾部仍是空洞）。
+        // 必须用 synchronous=true 精确拉取该区间，等待其真正落盘。
+        if (!s.completed.value) {
+            probeNonZero(s, offset)
+            // 尾部窗口再校验文件末端，保证 moov 整段都已落盘
+            if (nearTail && s.expectedSize > PROBE_BYTES) {
+                probeNonZero(s, s.expectedSize - PROBE_BYTES)
+            }
+        }
 
         // 等待期间文件可能整文件完成 → 改用最终文件引用（globalOffset=0）
         if (s.completed.value) {
@@ -247,7 +305,7 @@ class StreamingDownloadManager(
         jobs.forEach { it.canceled = true; it.job?.cancel() }
         scope.launch {
             runCatching {
-                td.tdCall(tdObj(
+                tdLong(tdObj(
                     "@type" to "cancelDownloadFile",
                     "file_id" to fileId,
                     "only_pending" to true,
@@ -303,15 +361,22 @@ class StreamingDownloadManager(
         sessions.getOrPut(fileId) { FileSession(fileId) }
 
     /** getFile 快照兜底（每会话一次）：补齐 path/completion/size，避免冷启动竞态。 */
+
+    /**
+     * 下载层 TD 调用统一走长超时：downloadFile（尤其 synchronous 模式）会阻塞到
+     * 区间真正落盘，默认 30s 会把慢速代理下的正常下载误判成超时并冒泡到 ExoPlayer。
+     */
+    private suspend fun tdLong(q: kotlinx.serialization.json.JsonObject): kotlinx.serialization.json.JsonObject =
+        td.tdCall(q, 600_000L)
+
     private suspend fun ensureSnapshot(s: FileSession) {
         if (s.snapshotted) return
         s.mutex.withLock {
             if (s.snapshotted) return
             try {
-                val resp = td.tdCall(tdObj("@type" to "getFile", "file_id" to s.fileId))
+                val resp = tdLong(tdObj("@type" to "getFile", "file_id" to s.fileId))
                 applyFileState(s, resp, establishBaseline = false)
             } catch (t: Throwable) {
-                Log.w(TAG, "getFile snapshot file=${s.fileId} failed: ${t.message}")
             }
             s.snapshotted = true
         }
@@ -321,6 +386,7 @@ class StreamingDownloadManager(
     private fun shiftWindowLocked(s: FileSession, newBase: Long) {
         cancelPending(s.fileId)   // 只取消排队分片，已落盘数据不丢
         s.base = newBase
+        s.tailBaseline = s.downloadedSize   // 尾部窗口可读判据的基线
         s.requestedEnd = newBase
         s.readable.value = 0L     // 新窗口从零重新计前缀
         s.awaitingBaseline = true // 丢弃旧引用 update，等新窗口首个响应
@@ -334,16 +400,15 @@ class StreamingDownloadManager(
      */
     private fun scheduleWindowChunksLocked(s: FileSession, aligned: Long, windowAhead: Long) {
         val targetEnd = aligned + windowAhead
+        // limit=0 的请求会从 aligned 连续下到文件末尾，单路即可覆盖整个窗口。
+        // 旧实现按 1MB 发 4 路带 limit 的请求，TDLib 每路只下 1MB 且互相抢占，
+        // 结果中段长期是空洞（实测播放报 Invalid NAL length 的根因）。
         var issued = false
-        var c = max(s.requestedEnd, aligned)
-        while (c < targetEnd) {
-            if (!s.chunks.containsKey(c)) {
-                launchChunk(s, c)
-                issued = true
-            }
-            s.requestedEnd = max(s.requestedEnd, c + CHUNK_BYTES)
-            c += CHUNK_BYTES
+        if (!s.chunks.containsKey(aligned)) {
+            launchChunk(s, aligned)
+            issued = true
         }
+        s.requestedEnd = max(s.requestedEnd, targetEnd)
         if (issued) s.failure = null   // 有新 chunk 补发 → 清除粘滞失败，重新给机会
     }
 
@@ -372,11 +437,13 @@ class StreamingDownloadManager(
                 val entry = s.chunks[chunkOffset]
                 if (s.failure != null || entry == null || entry.canceled) return
                 try {
-                    val resp = td.tdCall(tdObj(
+                    val resp = tdLong(tdObj(
                         "@type" to "downloadFile",
                         "file_id" to s.fileId,
                         "offset" to chunkOffset,
-                        "limit" to CHUNK_BYTES,
+                        // 0 = 不限量：TDLib 会从 offset 连续下到文件末尾。
+                        // 传 CHUNK_BYTES 只会下这一小段，后续区间永远是空洞。
+                        "limit" to 0,
                         "priority" to PRIORITY_STREAM,
                     ))
                     // 响应即 file 快照；新窗口首个（base chunk）响应建立 prefix 基线
@@ -418,7 +485,7 @@ class StreamingDownloadManager(
         while (true) {
             coroutineContext.ensureActive()
             s.failure?.let { throw it }
-            if (s.completed.value || s.readable.value >= chunkEnd) return
+            if (readyNow(s, s.base, chunkEnd, chunkEnd)) return
             val entry = s.chunks[chunkOffset]
             if (entry == null || entry.canceled) return   // 已被前缀覆盖完成 / 窗口平移
             val cur = s.readable.value
@@ -437,7 +504,106 @@ class StreamingDownloadManager(
      * 挂起等待绝对终点 endAbs 可读（updateFile 驱动；每 SNAPSHOT_FALLBACK_MS getFile 快照
      * 兜底防 update 丢失；WAIT_TIMEOUT_MS 超时上抛 DownloadException）。
      */
-    private suspend fun awaitReadable(s: FileSession, endAbs: Long) {
+    /**
+     * 同步精确拉取 [offset, offset+length)：TDLib 的 synchronous 模式会真正等待
+     * 该区间下载完成再返回，是唯一能可靠拿到"文件尾"这种非顺序区间的途径。
+     */
+    private suspend fun fetchRangeSync(s: FileSession, offset: Long, length: Long) {
+        val limit = length.coerceAtLeast(1L)
+        repeat(3) { attempt ->
+            val resp = try {
+                withTimeoutOrNull(SYNC_FETCH_TIMEOUT_MS) {
+                    tdLong(
+                        tdObj(
+                            "@type" to "downloadFile",
+                            "file_id" to s.fileId,
+                            "offset" to offset,
+                            "limit" to limit,
+                            "priority" to PRIORITY_STREAM,
+                            "synchronous" to true,
+                        )
+                    )
+                }
+            } catch (e: TdRequestException) {
+                // 200 = 被另一个 downloadFile 请求取消（并发分片抢占），退避后重试即可
+                delay(500L)
+                null
+            }
+            if (resp != null) {
+                applyFileState(s, resp, establishBaseline = false)
+                return
+            }
+        }
+    }
+
+    /**
+     * 校验 [offset] 处磁盘真实字节已落盘（非全 0x00）。
+     *
+     * TDLib 下载文件时先按完整尺寸预分配（稀疏文件），未下载区域读出来是 0。
+     * TDLib 自报的 downloaded_prefix_size / downloaded_size 在并发多窗口下会串台，
+     * 因此这里直接读磁盘，只有拿到真实非零字节才算可读 —— MP4 的 ftyp/moov
+     * 都是非零数据，用全 0 判据可以准确区分"已落盘"与"空洞"。
+     */
+    private suspend fun probeNonZero(s: FileSession, offset: Long) {
+        val deadline = System.currentTimeMillis() + PROBE_TIMEOUT_MS
+        var logged = false
+        while (true) {
+            val path = s.partialPath.value
+            if (path != null) {
+                val ok = runCatching {
+                    java.io.RandomAccessFile(path, "r").use { raf ->
+                        if (raf.length() <= offset) return@use false
+                        raf.seek(offset)
+                        val buf = ByteArray(PROBE_BYTES)
+                        val n = raf.read(buf)
+                        n > 0 && buf.any { it.toInt() != 0 }
+                    }
+                }.getOrDefault(false)
+                if (ok) return
+            }
+            if (!logged) {
+                logged = true
+            }
+            val now = System.currentTimeMillis()
+            if (now >= deadline) {
+                throw DownloadException("file ${s.fileId} offset=$offset 区域未落盘（${PROBE_TIMEOUT_MS / 1000}s）")
+            }
+            // 刷新快照并重发该点下载请求，避免空洞永久存在
+            runCatching {
+                applyFileState(s, tdLong(tdObj("@type" to "getFile", "file_id" to s.fileId)), false)
+            }
+            runCatching {
+                tdLong(
+                    tdObj(
+                        "@type" to "downloadFile",
+                        "file_id" to s.fileId,
+                        "offset" to offset,
+                        "limit" to 0,
+                        "priority" to PRIORITY_STREAM,
+                    )
+                )
+            }
+            delay(PROBE_POLL_MS)
+        }
+    }
+
+    /** 双判据：头部窗口看连续前缀；尾部窗口看相对窗口基线的累计下载量。 */
+    private fun readyNow(s: FileSession, base: Long, prefixTarget: Long, endAbs: Long): Boolean {
+        if (s.completed.value) return true
+        if (s.readable.value >= prefixTarget) return true
+        if (base > 0L) {
+            val need = endAbs - base
+            if (need > 0L && s.downloadedSize - s.tailBaseline >= need) return true
+        }
+        return false
+    }
+
+    private suspend fun awaitReadable(
+        s: FileSession,
+        base: Long,
+        prefixTarget: Long,
+        endAbs: Long,
+    ) {
         val deadline = System.currentTimeMillis() + WAIT_TIMEOUT_MS
         var nextSnapshotAt = System.currentTimeMillis() + SNAPSHOT_FALLBACK_MS
         while (true) {
@@ -445,17 +611,16 @@ class StreamingDownloadManager(
             s.failure?.let {
                 throw DownloadException("file ${s.fileId} 下载失败: ${it.message}", it)
             }
-            if (s.completed.value || s.readable.value >= endAbs) return
+            if (readyNow(s, base, prefixTarget, endAbs)) return
             val now = System.currentTimeMillis()
             if (now >= nextSnapshotAt) {
                 nextSnapshotAt = now + SNAPSHOT_FALLBACK_MS
                 try {
-                    val resp = td.tdCall(tdObj("@type" to "getFile", "file_id" to s.fileId))
+                    val resp = tdLong(tdObj("@type" to "getFile", "file_id" to s.fileId))
                     applyFileState(s, resp, establishBaseline = false)
                 } catch (t: Throwable) {
-                    Log.w(TAG, "snapshot fallback file=${s.fileId} failed: ${t.message}")
                 }
-                if (s.completed.value || s.readable.value >= endAbs) return
+                if (readyNow(s, base, prefixTarget, endAbs)) return
             }
             if (now >= deadline) {
                 throw DownloadException("file ${s.fileId} 等待分片超时（${WAIT_TIMEOUT_MS / 1000}s）")
@@ -473,6 +638,10 @@ class StreamingDownloadManager(
      */
     private fun applyFileState(s: FileSession, file: JsonObject, establishBaseline: Boolean) {
         val local = file["local"] as? JsonObject ?: return
+
+        (local["downloaded_size"] as? JsonPrimitive)?.longOrNull
+            ?.takeIf { it > 0L }
+            ?.let { if (it > s.downloadedSize) s.downloadedSize = it }
 
         (local["path"] as? JsonPrimitive)?.content
             ?.takeIf { it.isNotBlank() }
@@ -531,7 +700,6 @@ class StreamingDownloadManager(
                 }
                 enforceLruCap()
             } catch (t: Throwable) {
-                Log.w(TAG, "LRU promote $uid failed", t)
             } finally {
                 promoting.remove(uid)
             }

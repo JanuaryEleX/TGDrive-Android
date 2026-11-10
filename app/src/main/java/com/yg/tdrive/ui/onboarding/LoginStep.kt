@@ -38,12 +38,13 @@ fun LoginStepContent(onReady: () -> Unit) {
     // 进入登录步骤：应用已保存代理 + TDLib initialize（幂等，冷启动已跑也安全）
     LaunchedEffect(Unit) {
         val sl = ServiceLocator
-        sl.settings.proxy.first()?.let { snapshot ->
-            runCatching { sl.proxyManager.applySnapshot(snapshot, sl.context) }
-        }
+        // 先 initialize 再应用代理：TDLib 未初始化时 addProxy 可能不被应答
         val (apiId, apiHash) = sl.credentials.getOrBuiltIn()
         runCatching {
             sl.tdClient.initialize(apiId, apiHash, sl.tdDatabaseDir, sl.tdFilesDir)
+        }
+        sl.settings.proxy.first()?.let { snapshot ->
+            runCatching { sl.proxyManager.applySnapshot(snapshot, sl.context) }
         }
     }
 
