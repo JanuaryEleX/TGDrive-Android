@@ -25,6 +25,7 @@ sealed interface ProxyConfig {
         val pass: String?,
     ) : ProxyConfig
 
+    /** `type` 字段：ProxyType 子对象。 */
     fun toTdObject(): JsonObject = when (this) {
         is MtProto -> tdObj(
             "@type" to "proxyTypeMtproto",
@@ -42,4 +43,14 @@ sealed interface ProxyConfig {
             "http_only" to false
         )
     }
+
+    /**
+     * 完整的 `proxy` 对象：`proxy server:string port:int32 type:ProxyType = Proxy;`
+     * addProxy / pingProxy / testProxy 都要求这个嵌套结构，平铺会被判为 nullptr。
+     */
+    fun toTdProxy(): JsonObject = tdObj(
+        "server" to server,
+        "port" to port,
+        "type" to toTdObject(),
+    )
 }

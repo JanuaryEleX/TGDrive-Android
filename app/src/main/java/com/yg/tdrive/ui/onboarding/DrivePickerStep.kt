@@ -163,8 +163,14 @@ fun DrivePickerStep(onFinished: () -> Unit) {
                 saving = true
                 scope.launch {
                     try {
-                        options.filter { checked[it.chatId] == true }.forEach { opt ->
+                        val added = options.filter { checked[it.chatId] == true }.map { opt ->
                             ServiceLocator.driveManager.addDrive(opt.chatId, opt.title)
+                        }
+                        // 新建驱动器立即首扫：否则海报墙要等用户手动下拉才出内容
+                        added.forEach { drive ->
+                            runCatching {
+                                ServiceLocator.mediaRepository.fullScan(drive.id)
+                            }
                         }
                         onFinished()
                     } catch (t: Throwable) {

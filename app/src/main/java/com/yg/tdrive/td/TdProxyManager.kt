@@ -4,8 +4,23 @@ import android.content.Context
 import com.yg.tgdrive.settings.ProxySnapshot
 
 /**
- * 代理管理：持有当前生效配置并负责 addProxy/testProxy。
+ * 代理管理：持有当前生效配置并负责 addProxy/pingProxy。
  * TDLib 不支持运行时换代理 —— 修改后由 App 重建 TdClient（进程级重启）。
+ *
+ * ## addProxy 的真实签名（td_api.tl）
+ * ```
+ * addProxy proxy:proxy enable:Bool comment:string = AddedProxy;
+ * proxy server:string port:int32 type:ProxyType = Proxy;
+ * ```
+ * server/port/type 必须嵌在 `proxy` 对象里，**不能平铺**。
+ * 平铺时 TDLib 解析不到 `proxy` 字段 → proxy == nullptr →
+ * 400 "Proxy must be non-empty"（Proxy::create_proxy）。
+ *
+ * ## 测延迟用 pingProxy，不是 testProxy
+ * ```
+ * pingProxy proxy:proxy = Seconds;          // 返回秒数
+ * testProxy proxy:proxy dc_id:int32 timeout:double = Ok;  // 只回 Ok，无延迟值
+ * ```
  */
 class TdProxyManager(private val td: TdClient) {
 
@@ -17,9 +32,6 @@ class TdProxyManager(private val td: TdClient) {
      * - null → 直连
      * - [ProxySnapshot.System] → 探测系统 HTTP 代理；探测不到就直连（不报错，静默降级）
      * - 其余 → 直接映射
-     *
-     * 需要 Context 是因为 [ProxySnapshot.System] 的解析发生在运行时，
-     * 而 [ProxySnapshot.toConfig] 拿不到 Context。
      */
     suspend fun applySnapshot(snapshot: ProxySnapshot?, context: Context) {
         when (snapshot) {
@@ -39,26 +51,24 @@ class TdProxyManager(private val td: TdClient) {
         td.call(
             tdObj(
                 "@type" to "addProxy",
-                "server" to proxy.server,
-                "port" to proxy.port,
+                "proxy" to proxy.toTdProxy(),
                 "enable" to true,
-                "type" to proxy.toTdObject()
+                "comment" to "",
             )
         )
     }
 
-    /** 测试代理连通性，返回延迟 ms；失败返回 null。 */
+    /** 经代理 ping 主 DC，返回延迟 ms；失败返回 null。 */
     suspend fun test(proxy: ProxyConfig): Long? = try {
         val r = td.call(
             tdObj(
-                "@type" to "testProxy",
-                "server" to proxy.server,
-                "port" to proxy.port,
-                "type" to proxy.toTdObject(),
-                "dc_id" to 2    // Telegram 主 DC（Ashburn），经代理测往返
+                "@type" to "pingProxy",
+                "proxy" to proxy.toTdProxy(),
             )
         )
-        (r["milliseconds"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toLong()
+        (r["seconds"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toDoubleOrNull()
+            ?.takeIf { it >= 0 }
+            ?.let { (it * 1000).toLong() }
     } catch (t: Throwable) {
         null
     }

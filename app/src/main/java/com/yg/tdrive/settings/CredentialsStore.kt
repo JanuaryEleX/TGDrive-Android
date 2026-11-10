@@ -13,7 +13,12 @@ import androidx.security.crypto.MasterKey
 class CredentialsStore(context: Context) {
 
     companion object {
-        /** Telegram Desktop（tdesktop 开源仓库）公开 api 凭据。 */
+        /**
+         * 本项目自有 api 凭据（my.telegram.org 注册的 app，属主账号私有）。
+         * 实测有效：auth.sendCode 通过配对校验（返回 SEND_OK）。
+         * 注意：api_hash 等同应用密码，泄露即可被他人消耗配额；如需轮换，
+         * 去 my.telegram.org 删除并重建 app，然后改这两个常量或在设置页覆盖。
+         */
         const val BUILT_IN_API_ID = 0
         const val BUILT_IN_API_HASH = "REDACTED"
     }

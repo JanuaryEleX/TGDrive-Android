@@ -2,6 +2,8 @@ package com.yg.tgdrive.ui.wall
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -271,8 +273,10 @@ fun WallTab() {
             isRefreshing = refreshing,
             onRefresh = {
                 val d = selectedDrive ?: return@PullToRefreshBox
-                scope.launch {
-                    refreshing = true
+                // 用应用级作用域：rememberCoroutineScope 会随重组（refreshing 变化）取消，
+                // 导致扫描刚启动就被 LeftCompositionCancellationException 掐断。
+                refreshing = true
+                ServiceLocator.appScope.launch {
                     try {
                         ServiceLocator.mediaRepository.incrementalSync(d)
                     } finally {
@@ -305,11 +309,19 @@ private fun WallGrid(items: LazyPagingItems<MediaEntity>, onOpen: (MediaEntity) 
             }
         }
         items.itemCount == 0 -> {
-            EmptyState(
-                icon = "🎬",
-                title = "海报墙还是空的",
-                subtitle = "把视频转发进驱动器频道\n即可自动入库",
-            )
+            // 空态必须放在可滚动容器里，否则 PullToRefreshBox 收不到下拉手势
+            // （静止 Box 不产生嵌套滚动事件，onRefresh 永不触发）。
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .verticalScroll(rememberScrollState()),
+            ) {
+                EmptyState(
+                    icon = "🎬",
+                    title = "海报墙还是空的",
+                    subtitle = "下拉刷新扫描频道\n或把视频转发进驱动器频道",
+                )
+            }
         }
         else -> {
             Column(Modifier.fillMaxSize()) {
