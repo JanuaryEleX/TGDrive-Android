@@ -45,7 +45,6 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import com.yg.tgdrive.ServiceLocator
 import com.yg.tgdrive.data.ScanDiagnostics
-import com.yg.tgdrive.settings.CredentialsStore
 import com.yg.tgdrive.ui.common.DriveEntity
 import com.yg.tgdrive.ui.common.ProxyEditor
 import com.yg.tgdrive.ui.common.ProxyMode
@@ -416,8 +415,8 @@ private fun CredentialsSection() {
     }
     LaunchedEffect(Unit) { reload() }
 
-    val activeId = custom?.first ?: CredentialsStore.BUILT_IN_API_ID
-    val activeHash = custom?.second ?: CredentialsStore.BUILT_IN_API_HASH
+    val builtIn = ServiceLocator.credentials.builtInCreds()
+    val active = custom ?: builtIn
     val idValue = idText.trim().toIntOrNull()
     val idOk = idValue != null && idValue > 0
     val hashOk = ApiHashPattern.matches(hashText.trim())
@@ -431,8 +430,9 @@ private fun CredentialsSection() {
                     Text(
                         when {
                             !loaded -> "读取中…"
-                            custom == null -> "当前：内置凭据"
-                            else -> "当前：自定义凭据"
+                            custom != null -> "当前：自定义凭据"
+                            builtIn != null -> "当前：内置凭据"
+                            else -> "当前：未配置"
                         },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.primary,
@@ -444,7 +444,11 @@ private fun CredentialsSection() {
             }
             if (loaded) {
                 Text(
-                    "api_id = $activeId · api_hash = ${maskHash(activeHash)}",
+                    if (active != null) {
+                        "api_id = ${active.first} · api_hash = ${maskHash(active.second)}"
+                    } else {
+                        "尚未配置凭据，登录前必须填写。"
+                    },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -519,20 +523,23 @@ private fun CredentialsSection() {
                         enabled = canSave,
                         modifier = Modifier.weight(1f),
                     ) { Text("保存") }
-                    OutlinedButton(
-                        onClick = {
-                            scope.launch {
-                                withContext(Dispatchers.IO) { ServiceLocator.credentials.clear() }
-                                idText = ""
-                                hashText = ""
-                                error = null
-                                feedback = "已恢复内置凭据，重启应用后生效。"
-                                reload()
-                            }
-                        },
-                        enabled = loaded && custom != null,
-                        modifier = Modifier.weight(1f),
-                    ) { Text("恢复内置") }
+                    // release 无内置值：不展示「恢复内置」，否则点击会清空凭据并锁死登录
+                    if (builtIn != null) {
+                        OutlinedButton(
+                            onClick = {
+                                scope.launch {
+                                    withContext(Dispatchers.IO) { ServiceLocator.credentials.clear() }
+                                    idText = ""
+                                    hashText = ""
+                                    error = null
+                                    feedback = "已恢复内置凭据，重启应用后生效。"
+                                    reload()
+                                }
+                            },
+                            enabled = loaded && custom != null,
+                            modifier = Modifier.weight(1f),
+                        ) { Text("恢复内置") }
+                    }
                 }
             }
         }
