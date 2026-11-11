@@ -103,7 +103,7 @@ class TdClient {
             "api_hash" to apiHash,
             "device_model" to (android.os.Build.MODEL?.takeIf { it.isNotBlank() } ?: "Android"),
             "system_version" to ("Android " + (android.os.Build.VERSION.RELEASE ?: "")).trim(),
-            "application_version" to "0.1.0",
+            "application_version" to "0.2.0",
             "system_language_code" to lang,
             "database_directory" to databaseDir,
             "files_directory" to filesDir,

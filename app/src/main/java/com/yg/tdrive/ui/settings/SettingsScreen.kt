@@ -244,7 +244,7 @@ fun SettingsScreen(onBack: () -> Unit) {
             title = { Text("关于 TG云盘") },
             text = {
                 Text(
-                    "TG云盘 v0.1.0\n\n" +
+                    "TG云盘 v0.2.0\n\n" +
                         "用 Telegram 专用小号的私有频道当作私人网盘，" +
                         "TDLib 直连 MTProto 流播视频与图片，全程无自建服务端。\n\n" +
                         "免责：TG 云端无 SLA，请为重要内容保留独立备份；本应用仅供个人自用。",
