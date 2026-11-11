@@ -79,6 +79,13 @@ class StreamingDownloadManager(
         private const val WAIT_TIMEOUT_MS = 60_000L
 
         /**
+         * 顺序下载的"前视窗口"：目标位置超出「已落盘水位 + 该值」就判定为跳跃 seek，
+         * 需要取消在飞请求并重定位。取值要大于正常播放的缓冲需求（几 MB），
+         * 又要小到能让拖动及时生效。
+         */
+        private const val SEEK_LOOKAHEAD_BYTES = 16L * 1024 * 1024
+
+        /**
          * 探针读取窗口 = 单次 read 的落盘确认粒度。任意非零字节即视为该窗口已落盘，
          * 并把 [FileSession.confirmedEnd] 推进到窗口末尾（后续读同一区间不再探测）。
          */
@@ -407,6 +414,19 @@ class StreamingDownloadManager(
      */
     private suspend fun sendDownload(s: FileSession, offset: Long, tag: String) {
         if (s.failure != null) s.failure = null
+        // 跳跃 seek：必须先把在飞的 limit=0 顺序下载硬取消掉，否则两条请求会互相
+        // 取消（TDLib 同一 file 只允许一条），表现为 td error 200 + 永远等不到数据。
+        // 注意只取消请求、不置 abandoned——本会话还要继续用。
+        if (s.base >= 0L && offset != s.base) {
+            runCatching {
+                tdLong(tdObj(
+                    "@type" to "cancelDownloadFile",
+                    "file_id" to s.fileId,
+                    "only_pending" to false,
+                ))
+            }.onFailure { Log.w(TAG, "cancelDownloadFile before seek ${s.fileId} failed: ${it.message}") }
+            PlaybackDiag.relocate(s.base, offset)
+        }
         val violation = PlaybackDiag.requestEnter(s.fileId)
         if (violation) Log.e(TAG, "单请求不变式被破坏 file=${s.fileId} offset=$offset tag=$tag")
         try {
@@ -441,10 +461,28 @@ class StreamingDownloadManager(
         if (expected > 0L) min(need, (expected - offset).coerceAtLeast(1L)) else need
 
     /** 当前在飞请求是否已经覆盖 [aligned]（limit=0 = 从请求起点一路下到文件尾）。 */
+    /**
+     * 是否需要为 [aligned] 发一条新的 downloadFile。
+     *
+     * 旧实现是 `aligned < s.base`——只有往回拖才重发。这混淆了两种完全不同的场景：
+     * - **连续播放**：位置单调前进，落在 TDLib 顺序下载的推进方向内 → 不该重发
+     *   （重发会让 TDLib 反复重置游标、掉速，是"几秒后归零"的成因之一）。
+     * - **跳跃 seek**：位置跳到 TDLib 还没下到的地方 → **必须重定位**，
+     *   否则 awaitDataLocked 会一直轮询到超时（真机实测：拖到 336MB 等 20s 后取消）。
+     *
+     * 判据用"落盘水位"而不是"请求起点"：水位 = 已确认可读的最高偏移。
+     * 只要目标在 [水位, 水位+前视窗口] 内，说明顺序下载正朝它推进，等一会儿就有；
+     * 超出这个窗口（无论向前向后）都算跳跃，需要重定位。
+     */
     private fun needsNewRequest(s: FileSession, aligned: Long): Boolean {
         if (s.failure != null) return true        // 上一条失败（被取消/网络错）→ 重发
         if (s.base < 0L) return true              // 还没发过
-        return aligned < s.base                   // 只有向前 seek 才需要移动游标
+        // 往回拖：目标已在已下载区间之前，顺序游标不会回头 → 必须重定位
+        if (aligned < s.base) return true
+        // 向前拖：看是否落在顺序下载的前视窗口内
+        val watermark = maxOf(s.confirmedEnd, if (s.base > 0L) s.base + s.readable.value else s.readable.value)
+        val ahead = aligned - watermark
+        return ahead > SEEK_LOOKAHEAD_BYTES
     }
 
     /** TDLib 的「被另一个 downloadFile 取消」（code 200 + Canceled）判定。 */

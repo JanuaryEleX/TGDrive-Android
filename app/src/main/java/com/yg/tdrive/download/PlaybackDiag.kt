@@ -6,6 +6,7 @@ import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
@@ -73,6 +74,10 @@ object PlaybackDiag {
 
     // ── 取消归因（td error 200 / Canceled by another downloadFile request） ──
     private val cancelCount = AtomicLong()
+
+    /** 跳跃 seek 重定位次数与明细（from/to）。 */
+    private val relocations = AtomicLong()
+    private val seeks = mutableListOf<Map<String, Long>>()
     private val cancelAtStep = ConcurrentHashMap<String, Long>()
 
     // ── 单请求不变式观测（按 file 计，不是全局：不同文件各自一条请求是合法的） ──
@@ -254,6 +259,15 @@ object PlaybackDiag {
         if (outcome != "ok") Log.i(TAG, "probe off=$offset polls=$polls -> $outcome (${ms}ms)")
     }
 
+    /** 跳跃 seek 重定位（取消旧请求 → 从新偏移重新发起）。 */
+    fun relocate(from: Long, to: Long) {
+        relocations.incrementAndGet()
+        synchronized(seeks) {
+            if (seeks.size < 50) seeks.add(mapOf("from" to from, "to" to to))
+        }
+        Log.i(TAG, "RELOCATE $from -> $to (total=${relocations.get()})")
+    }
+
     /** TDLib 取消（error 200）。tag = 发起该请求的调用点。 */
     fun cancel(tag: String) {
         cancelCount.incrementAndGet()
@@ -313,6 +327,10 @@ object PlaybackDiag {
                     put("concurrency", streamConcurrency)
                     put("boxChain", buildJsonArray { boxChain.forEach { add(JsonPrimitive(it)) } })
                     put("cancelCount", cancelCount.get())
+                    put("relocations", relocations.get())
+                    put("seeks", JsonArray(synchronized(seeks) {
+                        seeks.map { m -> JsonObject(m.mapValues { JsonPrimitive(it.value) }) }
+                    }))
                     put(
                         "cancelAtStep",
                         buildJsonObject {
