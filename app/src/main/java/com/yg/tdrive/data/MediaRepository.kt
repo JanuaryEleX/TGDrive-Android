@@ -612,8 +612,10 @@ class MediaRepository(
                 val lastId = messages.last()["id"]?.jsonPrimitive?.longOrNull ?: break
                 if (lastId == 0L) break
                 if (messages.size < SCAN_PAGE_SIZE) {
+                    // 回填只在安装后跑一次，宁可多等 TDLib 补齐历史也别漏段：
+                    // 用独立的（较大的）重试上限，不受扫描侧 SHORT_PAGE_RETRIES=1 影响。
                     shortRetries++
-                    if (shortRetries > SHORT_PAGE_RETRIES) break
+                    if (shortRetries > BACKFILL_SHORT_PAGE_RETRIES) break
                     delay(SHORT_PAGE_DELAY_MS)
                     continue
                 }
@@ -1107,6 +1109,8 @@ class MediaRepository(
 
         /** 空页重试上限：TDLib 刚登录/重启时历史未落盘，getChatHistory 会先返回空。 */
         private const val EMPTY_PAGE_RETRIES = 30
+        /** 相册回填的同页重试上限（一次性作业，允许慢，保持原有 30 次）。 */
+        private const val BACKFILL_SHORT_PAGE_RETRIES = 30
         /**
          * 同页无新 id 的原地重试上限。上限 1 = 同一 from_message_id 最多请求 2 次
          * （验收 maxPageRepeats ≤ 2）；每次不再解析页面，只等 TDLib 补更早历史。
