@@ -10,9 +10,11 @@ import com.yg.tgdrive.td.tdObj
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.firstOrNull
@@ -85,6 +87,9 @@ class MediaRepository(
     /** 缩略图下载并发上限（priority=2 小文件，4 路足够，SPEC §7 速率约束之内）。 */
     private val thumbSemaphore = Semaphore(4)
 
+    /** 本轮已派发的缩略图作业（分阶段补封面时 join，保证「先图片后视频」）。 */
+    private val thumbJobs = java.util.concurrent.ConcurrentLinkedQueue<Job>()
+
 
     // ── 扫描进度：UI 顶部进度条订阅（主页/设置页共用） ──
     private val _scanProgress = MutableStateFlow(ScanProgress())
@@ -99,8 +104,19 @@ class MediaRepository(
 
     /**
      * 全量首扫（SPEC §4.2 第1~3步）：getChatHistory(chat_id, from_message_id=0, limit=100)
-     * 循环翻页到头部（返回数 < limit 即头部）；每页 delay(150) 节流。
-     * 扫完清理 stale 行、写 last_scanned_message_id、置 scan_state=done。
+     * 循环翻页到头部；每页 delay(150) 节流。
+     *
+     * 翻页正确性（本轮修复）：
+     * - 每轮记录已处理的 message_id 集合，**同一页永不重复解析**（翻页返回包含起始
+     *   message_id，边界条目天然重复一次，被去重）。
+     * - 只要本页带来新 id 就继续向更老推进；返回不足一页且**没有新 id** 才算「TDLib
+     *   已无更老历史」；仅此处做最多 SHORT_PAGE_RETRIES 次原地重试。
+     * - 只有 `messages.isEmpty()` 才是「到达头部」的确认信号 → DONE + last_scanned=本轮最新 id。
+     * - 重试耗尽 = 无法确认头部 → ERROR，last_scanned 只写到本轮到达的最老 id，
+     *   绝不写 newestId（否则未扫段会被 incrementalSync 的幂等短路永久跳过）。
+     *
+     * 扫完清理 stale 行，然后按「阶段1 图片封面 → 阶段2 视频相册封面/自身封面」补封面，
+     * 最后落 scan_state。
      */
     suspend fun fullScan(driveId: Long) {
         val drive = driveDao.getById(driveId) ?: return
@@ -109,11 +125,16 @@ class MediaRepository(
         var scanned = 0
         var inserted = 0
         var emptyRetries = 0
-        var shortRetries = 0
+        var stuckRetries = 0
+        var newestId = 0L
+        var oldestReached = 0L
+        val processedIds = HashSet<Long>()
+        // messageId → 本轮解析到的缩略图 file 对象：给「库里已存在但缺封面」的行重试用，
+        // 避免为了拿 thumbnail.file 再发一轮 getMessage。
+        val roundThumbs = HashMap<Long, JsonObject>()
         publishProgress(ScanProgress(driveId = driveId, running = true))
         try {
             val chatId = drive.chatId
-            var newestId = 0L
             var fromMessageId = 0L
             while (true) {
                 ScanDiagnostics.page(fromMessageId)
@@ -130,51 +151,67 @@ class MediaRepository(
                 val messages = resp["messages"]?.jsonArray
                     ?.mapNotNull { it as? JsonObject } ?: emptyList()
                 if (messages.isEmpty()) {
-                    // TDLib 历史尚未落盘时会先返回空页。直接 break 曾把 last_scanned 写成
-                    // 最新 id，导致之后所有增量同步被幂等短路 → 永远空库。
-                    if (emptyRetries < EMPTY_PAGE_RETRIES) {
-                        emptyRetries++
-                        publishProgress(
-                            ScanProgress(driveId, true, scanned, inserted, "等待 Telegram 下发历史…")
+                    // 唯一可确认「到头」的信号。首轮空页仍可能是 TDLib 历史未落盘。
+                    if (processedIds.isEmpty()) {
+                        if (emptyRetries < EMPTY_PAGE_RETRIES) {
+                            emptyRetries++
+                            publishProgress(
+                                ScanProgress(driveId, true, scanned, inserted, "等待 Telegram 下发历史…")
+                            )
+                            delay(EMPTY_PAGE_DELAY_MS)
+                            continue
+                        }
+                        throw IllegalStateException(
+                            "历史未就绪：连续 $EMPTY_PAGE_RETRIES 次空页，本轮中止（可重扫重试）"
                         )
-                        delay(EMPTY_PAGE_DELAY_MS)
-                        continue
                     }
-                    // 重试耗尽：视为本轮未扫完，标记 ERROR 而非 DONE，
-                    // 避免 last_scanned 被写成最新 id 后增量同步永久幂等短路
-                    throw IllegalStateException(
-                        "历史未就绪：连续 $EMPTY_PAGE_RETRIES 次空页，本轮中止（可重扫重试）"
-                    )
+                    break
                 }
                 emptyRetries = 0
 
-                if (newestId == 0L) {
-                    newestId = messages.first()["id"]?.jsonPrimitive?.longOrNull ?: 0L
+                val pageIds = messages.mapNotNull {
+                    it["id"]?.jsonPrimitive?.longOrNull
                 }
-                scanned += messages.size
-                inserted += ingestPage(chatId, driveId, messages)
-                publishProgress(ScanProgress(driveId, true, scanned, inserted))
-
-                val lastId = messages.last()["id"]?.jsonPrimitive?.longOrNull ?: 0L
-                if (lastId == 0L) break
-                // 不足一页不一定是到头：TDLib 只返回已缓存部分，中间段还没拉下来。
-                // 关键：短页时**不推进** fromMessageId，原地重试，否则会永久跳过未缓存区段。
-                if (messages.size < SCAN_PAGE_SIZE) {
-                    shortRetries++
-                    if (shortRetries > SHORT_PAGE_RETRIES) break
+                val fresh = messages.filter { msg ->
+                    val id = msg["id"]?.jsonPrimitive?.longOrNull
+                    id != null && id !in processedIds
+                }
+                if (fresh.isEmpty()) {
+                    // 同页重复返回且没有任何新 id：TDLib 已给不出更老的历史。
+                    // 不解析、不入库（保持 parsedByKind 可信），只短暂等待并用尽重试上限。
+                    stuckRetries++
+                    if (stuckRetries > SHORT_PAGE_RETRIES) {
+                        throw ScanIncompleteException(
+                            "翻页无新消息：连续 $SHORT_PAGE_RETRIES 次重复同页（from=$fromMessageId），头部未确认"
+                        )
+                    }
                     publishProgress(
                         ScanProgress(driveId, true, scanned, inserted, "等待更早的历史…")
                     )
                     delay(SHORT_PAGE_DELAY_MS)
                     continue
                 }
-                shortRetries = 0
-                fromMessageId = lastId
+                stuckRetries = 0
+                processedIds.addAll(pageIds)
+                pageIds.forEach { id ->
+                    if (id > newestId) newestId = id
+                    if (oldestReached == 0L || id < oldestReached) oldestReached = id
+                }
+                val ingested = ingestPage(chatId, driveId, fresh)
+                roundThumbs.putAll(ingested.thumbs)
+                inserted += ingested.inserted
+                scanned += fresh.size
+                publishProgress(ScanProgress(driveId, true, scanned, inserted))
+
+                val pageOldestId = pageIds.minOrNull() ?: break
+                fromMessageId = pageOldestId
                 delay(PAGE_DELAY_MS)
             }
             mediaDao.deleteStaleByDrive(driveId)
-            // 已入库但缺封面的行（字段名修正前写入的旧数据）无法从消息重取，
-            // 这里仅统计，实际补抓由下一轮 parseMedia 自然完成。
+
+            // 两阶段补封面（顺序关键）：图片全部落盘后，视频才能拿同组图封面。
+            runCoverPhases(driveId, roundThumbs, scanned, inserted)
+
             val missing = mediaDao.countMissingThumb(driveId)
             if (missing > 0) Log.w(TAG, "drive=$driveId 仍有 $missing 条缺封面")
             // 诊断：本轮结束后 DB 里 video/image 的真实行数（含往轮遗留），
@@ -184,6 +221,17 @@ class MediaRepository(
             )
             driveDao.setLastScannedMessageId(driveId, newestId)
             driveDao.setScanState(driveId, ScanState.DONE)
+        } catch (e: ScanIncompleteException) {
+            // 未确认头部：保留真实的续扫边界（最老已到达 id），标记 ERROR 而非 DONE。
+            // 已入库部分仍按两阶段补封面（幂等，下一轮会继续收敛）。
+            Log.e(TAG, "fullScan drive=$driveId incomplete: ${e.message}")
+            ScanDiagnostics.error(e.message ?: "incomplete")
+            runCoverPhases(driveId, roundThumbs, scanned, inserted)
+            ScanDiagnostics.dbKindCounts(
+                mediaDao.getAllByDrive(driveId).groupingBy { it.kind }.eachCount()
+            )
+            if (oldestReached > 0) driveDao.setLastScannedMessageId(driveId, oldestReached)
+            driveDao.setScanState(driveId, ScanState.ERROR)
         } catch (t: Throwable) {
             if (t is CancellationException) {
                 ScanDiagnostics.error("cancelled")
@@ -203,6 +251,9 @@ class MediaRepository(
     /**
      * 增量同步（SPEC §4.2 第4步）：从当前 last_message 向下扫到 last_scanned_message_id
      * 为止（仅 strictly newer 消息入库）。无新消息幂等返回。
+     *
+     * 与 fullScan 同一套翻页规则：页内重复 id 只解析一次；无新 id 的同页重试有上限，
+     * 耗尽 → ERROR 且 last_scanned 只推进到本轮到达的最老 id（不谎报 newestId）。
      */
     suspend fun incrementalSync(driveId: Long) {
         val drive = driveDao.getById(driveId) ?: return
@@ -211,7 +262,10 @@ class MediaRepository(
         var scanned = 0
         var inserted = 0
         var emptyRetries = 0
-        var shortRetries = 0
+        var stuckRetries = 0
+        var oldestReached = 0L
+        val processedIds = HashSet<Long>()
+        val roundThumbs = HashMap<Long, JsonObject>()
         publishProgress(ScanProgress(driveId = driveId, running = true))
         try {
             val chatId = drive.chatId
@@ -252,41 +306,66 @@ class MediaRepository(
                         delay(EMPTY_PAGE_DELAY_MS)
                         continue
                     }
-                    // 重试耗尽：视为本轮未扫完，标记 ERROR 而非 DONE，
-                    // 避免 last_scanned 被写成最新 id 后增量同步永久幂等短路
+                    // 重试耗尽：本轮未扫完，标记 ERROR 而非 DONE
                     throw IllegalStateException(
                         "历史未就绪：连续 $EMPTY_PAGE_RETRIES 次空页，本轮中止（可重扫重试）"
                     )
                 }
                 emptyRetries = 0
 
-                val stopHere = messages.any {
-                    (it["id"]?.jsonPrimitive?.longOrNull ?: 0L) <= stopId
+                val pageIds = messages.mapNotNull {
+                    it["id"]?.jsonPrimitive?.longOrNull
                 }
-                val fresh = messages.filter {
-                    (it["id"]?.jsonPrimitive?.longOrNull ?: 0L) > stopId
+                val fresh = messages.filter { msg ->
+                    val id = msg["id"]?.jsonPrimitive?.longOrNull
+                    id != null && id !in processedIds
                 }
-                scanned += messages.size
-                if (fresh.isNotEmpty()) inserted += ingestPage(chatId, driveId, fresh)
-                publishProgress(ScanProgress(driveId, true, scanned, inserted))
-
-                if (stopHere) break
-                val lastId = messages.last()["id"]?.jsonPrimitive?.longOrNull ?: break
-                if (messages.size < SCAN_PAGE_SIZE) {
-                    shortRetries++
-                    if (shortRetries > SHORT_PAGE_RETRIES) break
+                if (fresh.isEmpty()) {
+                    stuckRetries++
+                    if (stuckRetries > SHORT_PAGE_RETRIES) {
+                        throw ScanIncompleteException(
+                            "翻页无新消息：连续 $SHORT_PAGE_RETRIES 次重复同页（from=$fromMessageId），未到达 stopId=$stopId"
+                        )
+                    }
                     delay(SHORT_PAGE_DELAY_MS)
                     continue
                 }
-                shortRetries = 0
-                fromMessageId = lastId
+                stuckRetries = 0
+                processedIds.addAll(pageIds)
+                pageIds.forEach { id ->
+                    if (oldestReached == 0L || id < oldestReached) oldestReached = id
+                }
+
+                val stopHere = messages.any {
+                    (it["id"]?.jsonPrimitive?.longOrNull ?: 0L) <= stopId
+                }
+                val toIngest = fresh.filter {
+                    (it["id"]?.jsonPrimitive?.longOrNull ?: 0L) > stopId
+                }
+                scanned += fresh.size
+                if (toIngest.isNotEmpty()) {
+                    val ingested = ingestPage(chatId, driveId, toIngest)
+                    inserted += ingested.inserted
+                    roundThumbs.putAll(ingested.thumbs)
+                }
+                publishProgress(ScanProgress(driveId, true, scanned, inserted))
+
+                if (stopHere) break
+                fromMessageId = pageIds.minOrNull() ?: break
                 delay(PAGE_DELAY_MS)
             }
+            // 有新增行才跑封面阶段（增量无新内容时避免全表相册子查询）。
+            if (inserted > 0) runCoverPhases(driveId, roundThumbs, scanned, inserted)
             ScanDiagnostics.dbKindCounts(
                 mediaDao.getAllByDrive(driveId).groupingBy { it.kind }.eachCount()
             )
             driveDao.setLastScannedMessageId(driveId, newestId)
             driveDao.setScanState(driveId, ScanState.DONE)
+        } catch (e: ScanIncompleteException) {
+            Log.e(TAG, "incrementalSync drive=$driveId incomplete: ${e.message}")
+            ScanDiagnostics.error(e.message ?: "incomplete")
+            if (oldestReached > 0) driveDao.setLastScannedMessageId(driveId, oldestReached)
+            driveDao.setScanState(driveId, ScanState.ERROR)
         } catch (t: Throwable) {
             if (t is CancellationException) {
                 ScanDiagnostics.error("cancelled")
@@ -303,17 +382,136 @@ class MediaRepository(
         }
     }
 
-    /** 单页入库：解析 → IGNORE 幂等插入（回读 rowId）→ 异步补抓缩略图。 */
-    private suspend fun ingestPage(chatId: Long, driveId: Long, messages: List<JsonObject>): Int {
+    /** 单页解析入库结果：新行数 + messageId→thumbnail.file（供分阶段补封面重试）。 */
+    private data class PageIngest(
+        val inserted: Int,
+        val thumbs: Map<Long, JsonObject>,
+    )
+
+    /**
+     * 单页入库：解析 → IGNORE 幂等插入（回读 rowId）→ 异步补抓缩略图。
+     * 调用方保证 `messages` 里没有本轮已处理过的 id（重复调用不会重复解析/下载）。
+     */
+    private suspend fun ingestPage(chatId: Long, driveId: Long, messages: List<JsonObject>): PageIngest {
         val parsed = messages.mapNotNull { parseMedia(chatId, driveId, it) }
-        if (parsed.isEmpty()) return 0
+        if (parsed.isEmpty()) return PageIngest(0, emptyMap())
         val entities = parsed.map { it.first }
         val rowIds = withContext(Dispatchers.IO) { mediaDao.insertAllIgnoring(entities) }
-        parsed.zip(rowIds) { (entity, thumb), rowId ->
-            // rowId == -1L：已存在的行（重扫），保留其本地覆盖（display_name/thumb_path），跳过缩略图
-            if (rowId != -1L) launchThumbJob(entity.copy(id = rowId), thumb)
+        val thumbs = HashMap<Long, JsonObject>()
+        parsed.forEachIndexed { i, (entity, thumb) ->
+            if (thumb != null) thumbs[entity.messageId] = thumb
+            // rowId == -1L：已存在的行（重扫），入库时不派发下载；缺封面由阶段1/2b 补
+            if (rowIds[i] != -1L) launchThumbJob(entity.copy(id = rowIds[i]), thumb)
         }
-        return rowIds.count { it != -1L }
+        return PageIngest(rowIds.count { it != -1L }, thumbs)
+    }
+
+    // ═══════════════════════ 封面：两阶段（相册优先） ═══════════════════════
+
+    /**
+     * 串起两阶段封面补齐（顺序不可换）：
+     * 阶段1 图片封面落盘 → 阶段2a 视频改用同相册首图封面 → 阶段2b 无相册图的视频补自身封面。
+     * 幂等：重复执行不产生新文件，只在值变化时 UPDATE。补封面失败不影响扫描状态。
+     */
+    private suspend fun runCoverPhases(
+        driveId: Long,
+        thumbs: Map<Long, JsonObject>,
+        scanned: Int,
+        inserted: Int,
+    ) {
+        try {
+            publishProgress(ScanProgress(driveId, true, scanned, inserted, "补图片封面…"))
+            fillImageCovers(driveId, thumbs)
+            publishProgress(ScanProgress(driveId, true, scanned, inserted, "分配相册封面…"))
+            assignAlbumCovers(driveId)
+            fillVideoCovers(driveId, thumbs)
+            recordCoverStats(driveId)
+        } catch (t: Throwable) {
+            if (t is CancellationException) throw t
+            Log.w(TAG, "补封面阶段失败 drive=$driveId", t)
+        }
+    }
+
+    /**
+     * 阶段1：先把图片封面补齐。
+     * 等本轮已派发的图片下载落盘后，对仍缺封面的图片行用本轮解析到的 thumbnail.file
+     * 再试一次（老行入库被 IGNORE，不会派发下载，这是它们一直缺封面的原因之一）。
+     */
+    private suspend fun fillImageCovers(driveId: Long, thumbs: Map<Long, JsonObject>) {
+        awaitThumbJobs()
+        val missing = withContext(Dispatchers.IO) { mediaDao.imagesMissingThumb(driveId) }
+        var retried = 0
+        for (row in missing) {
+            val thumb = thumbs[row.messageId] ?: continue
+            launchThumbJob(row, thumb)
+            retried++
+        }
+        if (retried > 0) {
+            Log.i(TAG, "阶段1 补图片封面: drive=$driveId 重试=$retried/${missing.size}")
+            awaitThumbJobs()
+        }
+    }
+
+    /**
+     * 阶段2a：视频封面一律改用同相册组内 `message_id` 最小的图片封面
+     * （用户定案：视觉统一，即使视频自身已有封面也覆盖）。SQL 见 MediaDao.videoAlbumCovers。
+     * 幂等：updateThumbPathIfChanged 只在值变化时写。
+     */
+    private suspend fun assignAlbumCovers(driveId: Long) {
+        val covers = withContext(Dispatchers.IO) { mediaDao.videoAlbumCovers(driveId) }
+        var assigned = 0
+        for (cover in covers) {
+            val path = cover.thumbPath ?: continue
+            val n = withContext(Dispatchers.IO) {
+                mediaDao.updateThumbPathIfChanged(cover.videoId, path)
+            }
+            if (n > 0) assigned++
+        }
+        Log.i(TAG, "阶段2 相册封面: drive=$driveId 分配=$assigned/${covers.size}")
+    }
+
+    /**
+     * 阶段2b：没有相册图封面的视频回退自身 `thumbnail`。
+     * 只处理 thumb_path 仍为 NULL 的行：已有相册封面/已成功下载的绝不覆盖。
+     */
+    private suspend fun fillVideoCovers(driveId: Long, thumbs: Map<Long, JsonObject>) {
+        val missing = withContext(Dispatchers.IO) { mediaDao.videosMissingThumb(driveId) }
+        var retried = 0
+        for (row in missing) {
+            val thumb = thumbs[row.messageId] ?: continue
+            launchThumbJob(row, thumb)
+            retried++
+        }
+        if (retried > 0) {
+            Log.i(TAG, "阶段2 补视频自身封面: drive=$driveId 重试=$retried/${missing.size}")
+            awaitThumbJobs()
+        }
+    }
+
+    /** 落盘本次封面统计（诊断报告 covers 段；人工验收「视频缺封面数下降」用）。 */
+    private suspend fun recordCoverStats(driveId: Long) {
+        val stats = withContext(Dispatchers.IO) {
+            mapOf(
+                "videoMissingThumb" to mediaDao.countMissingThumbByKind(driveId, MediaKind.VIDEO),
+                "imageMissingThumb" to mediaDao.countMissingThumbByKind(driveId, MediaKind.IMAGE),
+                "videoAlbumCover" to mediaDao.videoAlbumCovers(driveId).count { it.thumbPath != null },
+            )
+        }
+        ScanDiagnostics.covers(stats)
+    }
+
+    /**
+     * 等本轮已派发的缩略图作业结束。单个作业内部有 20s 超时，这里再加整体兜底，
+     * 避免异常情况下扫描状态永远停在 SCANNING。
+     */
+    private suspend fun awaitThumbJobs() {
+        val jobs = ArrayList<Job>()
+        while (true) {
+            val job = thumbJobs.poll() ?: break
+            jobs.add(job)
+        }
+        if (jobs.isEmpty()) return
+        withTimeoutOrNull(THUMB_PHASE_TIMEOUT_MS) { jobs.joinAll() }
     }
 
     // ═══════════════════════ 观察流 ═══════════════════════
@@ -414,8 +612,10 @@ class MediaRepository(
                 val lastId = messages.last()["id"]?.jsonPrimitive?.longOrNull ?: break
                 if (lastId == 0L) break
                 if (messages.size < SCAN_PAGE_SIZE) {
+                    // 回填只在安装后跑一次，宁可多等 TDLib 补齐历史也别漏段：
+                    // 用独立的（较大的）重试上限，不受扫描侧 SHORT_PAGE_RETRIES=1 影响。
                     shortRetries++
-                    if (shortRetries > SHORT_PAGE_RETRIES) break
+                    if (shortRetries > BACKFILL_SHORT_PAGE_RETRIES) break
                     delay(SHORT_PAGE_DELAY_MS)
                     continue
                 }
@@ -425,7 +625,12 @@ class MediaRepository(
             }
             Log.i(TAG, "相册回填: drive=$driveId 累计=$done")
         }
-        Log.i(TAG, "相册回填完成: 处理=$done 总缺=$total")
+        // 注意：done 只统计真正写入非空 album_id 的行（见 MediaDao.backfillAlbumId 的
+        // `:albumId IS NOT NULL`）。剩余缺相册的行既可能是本轮未覆盖，也可能是本身
+        // 就不是相册消息（media_album_id 在 TDLib 里为 0 → 归一化为 NULL），两者用下面的
+        // left 值 + 报告里的 totalMessages 对比判断。
+        val left = runCatching { mediaDao.countMissingAlbum() }.getOrDefault(-1)
+        Log.i(TAG, "相册回填完成: 实际填充=$done 总缺=$total 剩余缺=$left")
         return done
     }
 
@@ -806,12 +1011,13 @@ class MediaRepository(
 
     private fun launchThumbJob(entity: MediaEntity, thumbFile: JsonObject?) {
         if (thumbFile == null || appContext == null) return
-        scope.launch(Dispatchers.IO) {
+        val job = scope.launch(Dispatchers.IO) {
             thumbSemaphore.withPermit {
                 val path = downloadThumbnail(entity.fileUniqueId, thumbFile)
                 if (path != null) mediaDao.updateThumbPath(entity.id, path)
             }
         }
+        thumbJobs.add(job)
     }
 
     /** getFile 快照：已下载完成则直接返回 local.path。 */
@@ -902,13 +1108,20 @@ class MediaRepository(
         private const val DELETE_RECEIPT_TIMEOUT_MS = 30_000L
 
         /** 空页重试上限：TDLib 刚登录/重启时历史未落盘，getChatHistory 会先返回空。 */
-        /** 短页重试上限：TDLib 返回不足一页并不代表到头，只是服务端历史还没拉够。 */
-        private const val SHORT_PAGE_RETRIES = 30
         private const val EMPTY_PAGE_RETRIES = 30
+        /** 相册回填的同页重试上限（一次性作业，允许慢，保持原有 30 次）。 */
+        private const val BACKFILL_SHORT_PAGE_RETRIES = 30
+        /**
+         * 同页无新 id 的原地重试上限。上限 1 = 同一 from_message_id 最多请求 2 次
+         * （验收 maxPageRepeats ≤ 2）；每次不再解析页面，只等 TDLib 补更早历史。
+         */
+        private const val SHORT_PAGE_RETRIES = 1
         /** 空页重试间隔（给 TDLib 后台拉历史的时间）。 */
         private const val EMPTY_PAGE_DELAY_MS = 2_000L
         /** 短页重试间隔：给 TDLib 从服务端拉更早历史的时间。 */
         private const val SHORT_PAGE_DELAY_MS = 2_500L
+        /** 分阶段补封面的整体等待上限（单作业内部另有 20s 超时）。 */
+        private const val THUMB_PHASE_TIMEOUT_MS = 180_000L
 
         private val VIDEO_EXTENSIONS = setOf("mp4", "mkv", "avi", "mov", "webm", "ts", "m4v")
 
@@ -985,3 +1198,10 @@ class MediaRepository(
     }
 }
 
+
+/**
+ * 翻页未确认到达头部（同页重复返回且重试耗尽）。
+ * 单独成类：fullScan/incrementalSync 在此出口必须写 ScanState.ERROR + 真实续扫边界，
+ * 绝不能落到 DONE（历史缺口会被增量同步的幂等短路永久跳过）。
+ */
+private class ScanIncompleteException(message: String) : Exception(message)
