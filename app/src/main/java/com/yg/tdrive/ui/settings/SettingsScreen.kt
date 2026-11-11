@@ -44,11 +44,13 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import com.yg.tgdrive.ServiceLocator
+import com.yg.tgdrive.data.ScanDiagnostics
 import com.yg.tgdrive.settings.CredentialsStore
 import com.yg.tgdrive.ui.common.DriveEntity
 import com.yg.tgdrive.ui.common.ProxyEditor
 import com.yg.tgdrive.ui.common.ProxyMode
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -73,6 +75,9 @@ fun SettingsScreen(onBack: () -> Unit) {
     var showLogoutConfirm by remember { mutableStateOf(false) }
     var showClearCacheConfirm by remember { mutableStateOf(false) }
     var showAbout by remember { mutableStateOf(false) }
+    // 【临时诊断】重扫取证入口的状态（定位视频丢因后整块删除）
+    var diagRunning by remember { mutableStateOf(false) }
+    var diagState by remember { mutableStateOf<String?>(null) }
 
     Column(
         modifier = Modifier
@@ -185,6 +190,44 @@ fun SettingsScreen(onBack: () -> Unit) {
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                    Spacer(Modifier.height(8.dp))
+                    // 【临时诊断】一键全量重扫并落 scan-diag.json（定位视频丢因后删除）
+                    OutlinedButton(
+                        onClick = {
+                            if (diagRunning) return@OutlinedButton
+                            diagRunning = true
+                            val report = java.io.File(context.filesDir, ScanDiagnostics.FILE_NAME).absolutePath
+                            diagState = "扫描中…（全量，约数分钟）"
+                            // 用 appScope：离开设置页不取消扫描，报告一定能落盘
+                            ServiceLocator.appScope.launch {
+                                try {
+                                    val drive = ServiceLocator.driveManager
+                                        .observeDrives().firstOrNull()?.firstOrNull()
+                                    if (drive == null) {
+                                        diagState = "没有驱动器，无法扫描"
+                                        return@launch
+                                    }
+                                    ScanDiagnostics.reset()
+                                    ServiceLocator.mediaRepository.fullScan(drive.id)
+                                    diagState = "完成 → $report"
+                                } catch (t: Throwable) {
+                                    diagState = "失败：${t.message ?: t.javaClass.simpleName}"
+                                } finally {
+                                    diagRunning = false
+                                }
+                            }
+                        },
+                        enabled = !diagRunning,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text("重扫并生成诊断报告") }
+                    diagState?.let {
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            it,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                     Spacer(Modifier.height(8.dp))
                     OutlinedButton(
                         onClick = { showLogoutConfirm = true },

@@ -105,6 +105,7 @@ class MediaRepository(
     suspend fun fullScan(driveId: Long) {
         val drive = driveDao.getById(driveId) ?: return
         driveDao.setScanState(driveId, ScanState.SCANNING)
+        ScanDiagnostics.begin("fullScan", driveId)
         var scanned = 0
         var inserted = 0
         var emptyRetries = 0
@@ -115,6 +116,7 @@ class MediaRepository(
             var newestId = 0L
             var fromMessageId = 0L
             while (true) {
+                ScanDiagnostics.page(fromMessageId)
                 val resp = callWithFloodRetry(
                     tdObj(
                         "@type" to "getChatHistory",
@@ -175,13 +177,23 @@ class MediaRepository(
             // 这里仅统计，实际补抓由下一轮 parseMedia 自然完成。
             val missing = mediaDao.countMissingThumb(driveId)
             if (missing > 0) Log.w(TAG, "drive=$driveId 仍有 $missing 条缺封面")
+            // 诊断：本轮结束后 DB 里 video/image 的真实行数（含往轮遗留），
+            // 与 parsedUniqueByKind 对比即可分清「解析丢」还是「重复页虚增」。
+            ScanDiagnostics.dbKindCounts(
+                mediaDao.getAllByDrive(driveId).groupingBy { it.kind }.eachCount()
+            )
             driveDao.setLastScannedMessageId(driveId, newestId)
             driveDao.setScanState(driveId, ScanState.DONE)
         } catch (t: Throwable) {
-            if (t is CancellationException) throw t
+            if (t is CancellationException) {
+                ScanDiagnostics.error("cancelled")
+                throw t
+            }
             Log.e(TAG, "fullScan drive=$driveId failed", t)
+            ScanDiagnostics.error(t.message ?: t.javaClass.simpleName)
             driveDao.setScanState(driveId, ScanState.ERROR)
         } finally {
+            ScanDiagnostics.report(appContext, "fullScan", driveId, scanned, inserted)
             publishProgress(
                 ScanProgress(driveId, false, scanned, inserted, if (inserted > 0) "完成" else "")
             )
@@ -195,6 +207,7 @@ class MediaRepository(
     suspend fun incrementalSync(driveId: Long) {
         val drive = driveDao.getById(driveId) ?: return
         driveDao.setScanState(driveId, ScanState.SCANNING)
+        ScanDiagnostics.begin("incrementalSync", driveId)
         var scanned = 0
         var inserted = 0
         var emptyRetries = 0
@@ -216,6 +229,7 @@ class MediaRepository(
             }
             var fromMessageId = newestId
             while (true) {
+                ScanDiagnostics.page(fromMessageId)
                 val resp = callWithFloodRetry(
                     tdObj(
                         "@type" to "getChatHistory",
@@ -268,13 +282,21 @@ class MediaRepository(
                 fromMessageId = lastId
                 delay(PAGE_DELAY_MS)
             }
+            ScanDiagnostics.dbKindCounts(
+                mediaDao.getAllByDrive(driveId).groupingBy { it.kind }.eachCount()
+            )
             driveDao.setLastScannedMessageId(driveId, newestId)
             driveDao.setScanState(driveId, ScanState.DONE)
         } catch (t: Throwable) {
-            if (t is CancellationException) throw t
+            if (t is CancellationException) {
+                ScanDiagnostics.error("cancelled")
+                throw t
+            }
             Log.e(TAG, "incrementalSync drive=$driveId failed", t)
+            ScanDiagnostics.error(t.message ?: t.javaClass.simpleName)
             driveDao.setScanState(driveId, ScanState.ERROR)
         } finally {
+            ScanDiagnostics.report(appContext, "incrementalSync", driveId, scanned, inserted)
             publishProgress(
                 ScanProgress(driveId, false, scanned, inserted, if (inserted > 0) "完成" else "")
             )
@@ -630,10 +652,20 @@ class MediaRepository(
      * mime 以 video/ 开头或后缀 ∈ {mp4,mkv,avi,mov,webm,ts,m4v} → video，其余 null。
      */
     private fun parseMedia(chatId: Long, driveId: Long, msg: JsonObject): Pair<MediaEntity, JsonObject?>? {
-        val messageId = msg["id"]?.jsonPrimitive?.longOrNull ?: return null
-        val messageDate = msg["date"]?.jsonPrimitive?.longOrNull ?: return null
-        val content = msg["content"] as? JsonObject ?: return null
+        // ── 临时诊断打点：每个失败出口一个稳定代号；video/文档/动画出口附带原始 content 样本 ──
+        val messageId = msg["id"]?.jsonPrimitive?.longOrNull
+            ?: return dropMedia(ScanDiagnostics.NO_ID)
+        val messageDate = msg["date"]?.jsonPrimitive?.longOrNull
+            ?: return dropMedia(ScanDiagnostics.NO_DATE)
+        val firstSeen = ScanDiagnostics.message(messageId)
+        val content = msg["content"] as? JsonObject
+            ?: return dropMedia(ScanDiagnostics.NO_CONTENT)
         val contentType = (content["@type"] as? JsonPrimitive)?.content ?: ""
+        ScanDiagnostics.record(contentType)
+        if (firstSeen) ScanDiagnostics.recordUnique(contentType)
+        ScanDiagnostics.keys(contentType, content.keys)
+        // 只给 messageVideo 的后续出口留样本：890 条缺口就出在这一类里。
+        val videoSample = content.takeIf { contentType == "messageVideo" }
 
         val fileObj: JsonObject
         val kind: String
@@ -648,12 +680,16 @@ class MediaRepository(
             "messageVideo" -> {
                 // TDLib video 类型：文件字段名是 video_file（非 file）；无 file_name 字段；
                 // 缩略图在 thumbnails:vector<photoSize>（photoSize.photo = file 对象）
-                val video = content["video"] as? JsonObject ?: return null
+                val video = content["video"] as? JsonObject
+                    ?: return dropMedia(ScanDiagnostics.VIDEO_NO_VIDEO_OBJ, videoSample)
+                ScanDiagnostics.keys("messageVideo.video", video.keys)
                 // 实测 tdjson 1.8.65：video 对象的文件字段就是 "video"，
                 // 旧版/文档中的 video_file 并不存在；兼容三者以防版本差异。
                 fileObj = (video["video"] as? JsonObject
                     ?: video["video_file"] as? JsonObject
-                    ?: video["file"] as? JsonObject) ?: return null
+                    ?: video["file"] as? JsonObject)
+                    ?: return dropMedia(ScanDiagnostics.VIDEO_NO_FILE, videoSample)
+                ScanDiagnostics.keys("messageVideo.video.file", fileObj.keys)
                 kind = MediaKind.VIDEO
                 mime = (video["mime_type"] as? JsonPrimitive)?.content
                 displayName = (video["file_name"] as? JsonPrimitive)?.content ?: ""
@@ -664,9 +700,11 @@ class MediaRepository(
                     ?: smallestThumb(video["thumbnails"] as? JsonArray)
             }
             "messagePhoto" -> {
-                val photo = content["photo"] as? JsonObject ?: return null
+                val photo = content["photo"] as? JsonObject
+                    ?: return dropMedia(ScanDiagnostics.PHOTO_NO_PHOTO)
                 // photoSize.file 本身无宽高字段，宽高取自最大的 photoSize 块
-                fileObj = photoMainFile(photo) ?: return null
+                fileObj = photoMainFile(photo)
+                    ?: return dropMedia(ScanDiagnostics.PHOTO_NO_FILE)
                 kind = MediaKind.IMAGE
                 photoMainSize(photo)?.let { biggest ->
                     width = biggest["width"]?.jsonPrimitive?.longOrNull?.toInt()
@@ -675,24 +713,32 @@ class MediaRepository(
                 thumbFile = photoThumbFile(photo)
             }
             "messageDocument" -> {
-                val doc = content["document"] as? JsonObject ?: return null
+                val doc = content["document"] as? JsonObject
+                    ?: return dropMedia(ScanDiagnostics.DOC_NO_DOC, content)
+                ScanDiagnostics.keys("messageDocument.document", doc.keys)
                 mime = (doc["mime_type"] as? JsonPrimitive)?.content
                 displayName = (doc["file_name"] as? JsonPrimitive)?.content ?: ""
                 val isVideo = mime?.startsWith("video/") == true ||
                     displayName.substringAfterLast('.', "").lowercase(Locale.US) in VIDEO_EXTENSIONS
-                if (!isVideo) return null
+                if (!isVideo) return dropMedia(ScanDiagnostics.DOC_NOT_VIDEO, content)
                 // TDLib document 类型：文件字段名是 document_file（非 document）
                 fileObj = (doc["document"] as? JsonObject
-                    ?: doc["document_file"] as? JsonObject) ?: return null
+                    ?: doc["document_file"] as? JsonObject)
+                    ?: return dropMedia(ScanDiagnostics.DOC_NO_FILE, content)
+                ScanDiagnostics.keys("messageDocument.document.file", fileObj.keys)
                 kind = MediaKind.VIDEO
                 thumbFile = singleThumb(doc["thumbnail"] as? JsonObject)
                     ?: smallestThumb(doc["thumbnails"] as? JsonArray)
             }
             "messageAnimation" -> {
                 // GIF/无声视频（TDLib animation 类型），按视频入库（多为 mp4/gif 可播）
-                val anim = content["animation"] as? JsonObject ?: return null
+                val anim = content["animation"] as? JsonObject
+                    ?: return dropMedia(ScanDiagnostics.ANIM_NO_ANIM, content)
+                ScanDiagnostics.keys("messageAnimation.animation", anim.keys)
                 fileObj = (anim["animation"] as? JsonObject
-                    ?: anim["animation_file"] as? JsonObject) ?: return null
+                    ?: anim["animation_file"] as? JsonObject)
+                    ?: return dropMedia(ScanDiagnostics.ANIM_NO_FILE, content)
+                ScanDiagnostics.keys("messageAnimation.animation.file", fileObj.keys)
                 kind = MediaKind.VIDEO
                 mime = (anim["mime_type"] as? JsonPrimitive)?.content
                 displayName = (anim["file_name"] as? JsonPrimitive)?.content ?: ""
@@ -702,13 +748,17 @@ class MediaRepository(
                 thumbFile = singleThumb(anim["thumbnail"] as? JsonObject)
                     ?: smallestThumb(anim["thumbnails"] as? JsonArray)
             }
-            else -> return null
+            else -> return dropMedia(ScanDiagnostics.unknownType(contentType), content)
         }
 
         val remote = fileObj["remote"] as? JsonObject
-        val remoteFileId = (remote?.get("id") as? JsonPrimitive)?.content ?: return null
-        val fileUniqueId = (remote?.get("unique_id") as? JsonPrimitive)?.content ?: return null
-        val fileId = fileObj["id"]?.jsonPrimitive?.longOrNull?.toInt() ?: return null
+            ?: return dropMedia(ScanDiagnostics.NO_REMOTE, videoSample)
+        val remoteFileId = (remote["id"] as? JsonPrimitive)?.content
+            ?: return dropMedia(ScanDiagnostics.NO_REMOTE_ID, videoSample)
+        val fileUniqueId = (remote["unique_id"] as? JsonPrimitive)?.content
+            ?: return dropMedia(ScanDiagnostics.NO_UNIQUE_ID, videoSample)
+        val fileId = fileObj["id"]?.jsonPrimitive?.longOrNull?.toInt()
+            ?: return dropMedia(ScanDiagnostics.NO_FILE_ID, videoSample)
         val size = fileObj["expected_size"]?.jsonPrimitive?.longOrNull
             ?: fileObj["size"]?.jsonPrimitive?.longOrNull ?: 0L
 
@@ -741,7 +791,15 @@ class MediaRepository(
             thumbPath = null,
             stale = false,
         )
+        ScanDiagnostics.parsed(kind, firstSeen)
         return entity to thumbFile
+    }
+
+    /** 诊断专用：记一次失败原因（可选原始样本）。恒返回 null 供 `?: return` 使用；不改变解析结果。 */
+    private fun dropMedia(reason: String, content: JsonObject? = null): Nothing? {
+        ScanDiagnostics.drop(reason)
+        if (content != null) ScanDiagnostics.sample(reason, content)
+        return null
     }
 
     // ═══════════════════════ 内部：缩略图 ═══════════════════════
