@@ -20,6 +20,9 @@ class TgDriveApp : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        // 第一行：必须早于 ServiceLocator/TDLib 初始化，否则初始化阶段崩溃无法落盘。
+        // 处理器内部会转交原 handler，崩溃行为（系统对话框/进程终止）不变。
+        CrashLogger.install(this)
         ServiceLocator.init(this)
         ServiceLocator.appScope.launch {
             val sl = ServiceLocator
