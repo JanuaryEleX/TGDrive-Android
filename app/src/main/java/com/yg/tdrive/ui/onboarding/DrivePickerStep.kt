@@ -166,10 +166,14 @@ fun DrivePickerStep(onFinished: () -> Unit) {
                         val added = options.filter { checked[it.chatId] == true }.map { opt ->
                             ServiceLocator.driveManager.addDrive(opt.chatId, opt.title)
                         }
-                        // 新建驱动器立即首扫：否则海报墙要等用户手动下拉才出内容
-                        added.forEach { drive ->
-                            runCatching {
-                                ServiceLocator.mediaRepository.fullScan(drive.id)
+                        // 新建驱动器立即首扫：否则海报墙要等用户手动下拉才出内容。
+                        // 扫描是分钟级任务，必须挂 appScope：本步骤离开 composition 后
+                        // rememberCoroutineScope 会立刻取消，全量扫描会被腰斩。
+                        ServiceLocator.appScope.launch {
+                            added.forEach { drive ->
+                                runCatching {
+                                    ServiceLocator.mediaRepository.fullScan(drive.id)
+                                }
                             }
                         }
                         onFinished()
