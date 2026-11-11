@@ -1,30 +1,72 @@
 package com.yg.tgdrive.download
 
+import android.os.SystemClock
 import android.util.Log
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.io.RandomAccessFile
 
 /**
  * MP4 faststart 虚拟重排。
  *
- * Telegram 里大量 MP4 的 moov 位于文件尾（mdt 在前）。ExoPlayer 的 Mp4Extractor 会
+ * Telegram 里大量 MP4 的 moov 位于文件尾（mdat 在前）。ExoPlayer 的 Mp4Extractor 会
  * seek 到文件尾去读 moov，而它把"本次 load 的起点"当作文件原点，导致 moov 里的
  * 绝对采样偏移被二次叠加（实测 3966111032 + 3943661055 = 7909772095 > 文件长度），
  * 最终 load 越界 EOF，报 "Loading finished before preparation is complete"。
  *
  * 这里不改写整个文件（3.7GB 不可能整体下载），而是构造一个"虚拟文件"：
  *
- *   [ftyp] [moov(已按 +moovSize 重写 stco/co64)] [mdat ... 原始数据顺移 moovSize]
+ *   [ftyp/free 前缀] [moov(已按 +moovLen 重写 stco/co64)] [mdat ... 原始数据顺移 moovLen]
  *
  * 于是 moov 出现在文件前部，extractor 不再 seek 到尾部，所有偏移都是文件绝对坐标。
- * 虚拟长度 = 原长度 + moovSize，读取时按映射回落到原始偏移。
+ * 虚拟长度 = 原长度 + moovLen，读取时按映射回落到原始偏移（见 [Plan.toReal]）。
+ *
+ * ═══ 本版定位策略（替代旧的"盲读尾部 8MB"）═══
+ * 旧实现为了找 moov 无条件同步拉最后 8MB —— 对 4GB 文件意味着把唯一的 TDLib 下载游标
+ * 拨到尾部、与播放请求互踩，实测表现为「点进去有几秒速度，然后彻底不动」。
+ *
+ * 现在改为**逐跳读 box header**（每跳只读 16 字节），按 size 跳过大块：
+ *
+ *   典型 moov-at-tail 文件： ftyp(32B) → free(8B) → mdat(3.9GB, 只读 header) → moov
+ *     = 4 次 16 字节 header 读 + 1 次 moov 本体读；mdat 内容一个字节都不读。
+ *   典型 faststart 文件：    ftyp(32B) → moov(1.2MB)   ← 第 2 跳就发现 moov 在 mdat 之前，
+ *     直接判定 plan=null（原文件本来就正确），**完全不碰文件尾**，这是最大的提速点。
+ *
+ * 头部链断裂（size 字段损坏 / 非 MP4）时回退到旧的 [findTrailingBox]（拉尾部 8MB 搜签名）。
+ *
+ * ═══ 硬上限 ═══
+ * [build] 整体包 [PREPARE_PLAN_TIMEOUT_MS]：宁可先播起来（moov-at-tail 走 TdDataSource 可能
+ * 首播失败），也不能让用户对着黑屏等十分钟。
+ *
+ * ═══ 大文件分流 ═══
+ * 超过 [FASTSTART_MAX_BYTES] 的文件不做重排：在唯一的下载游标上抢尾部代价过高，
+ * 直接顺序流播；moov-at-tail 的大文件首播失败由播放页明确提示（+ 离线下载入口）。
  */
 object FaststartRemuxer {
 
     private const val TAG = "Faststart"
 
-    /** 一次拉取用于定位 moov 的尾部窗口上限。 */
+    /**
+     * 允许做 faststart 重排的文件大小上限。
+     * 超过此值的文件直接顺序流播（moov-at-tail 首播失败 → UI 提示完整下载）。
+     */
+    const val FASTSTART_MAX_BYTES = 300L * 1024 * 1024
+
+    /** prepare 阶段规划硬上限：超时即放弃重排，退回 TdDataSource 直连。 */
+    private const val PREPARE_PLAN_TIMEOUT_MS = 15_000L
+
+    /** box header 读取长度（size(4) + type(4) + 可选 largesize(8)）。 */
+    private const val HEADER_BYTES = 16L
+
+    /** header 链最多跳数（防止损坏文件把 size 读成 1 造成死循环/长链）。 */
+    private const val MAX_BOX_HOPS = 64
+
+    /** 回退方案：一次拉取用于定位 moov 的尾部窗口上限。 */
     private const val TAIL_SCAN_BYTES = 8L * 1024 * 1024
+
+    /** 允许出现在 moov 之前的顶层"前缀" box（虚拟布局里保持在原位）。 */
+    private val PREFIX_TYPES = setOf("ftyp", "free", "skip", "wide", "styp", "pdin")
 
     data class Plan(
         val fileId: Int,
@@ -51,40 +93,189 @@ object FaststartRemuxer {
             if (v < prefixLen) v else v - moovLen
     }
 
-    private class Box(val start: Long, val size: Long, val type: String)
-
-    /**
-     * 构建重排计划。失败返回 null（调用方退回直连播放）。
-     */
-    suspend fun build(mgr: StreamingDownloadManager, fileId: Int, size: Long): Plan? {
-        if (size <= 0L) { Log.w(TAG, "size<=0，跳过"); return null }
-        return runCatching { buildInner(mgr, fileId, size) }
-            .onFailure { Log.w(TAG, "构建失败 file=$fileId: ${it.message}") }
-            .getOrNull()
+    private class Box(val start: Long, val size: Long, val type: String) {
+        val end: Long get() = start + size
     }
 
-    private suspend fun buildInner(mgr: StreamingDownloadManager, fileId: Int, size: Long): Plan? {
+    /** buildInner 的结论：plan 非空 = 需要重排；reason 写进诊断。 */
+    private class Outcome(val plan: Plan?, val reason: String)
+
+    /**
+     * 构建重排计划。返回 null 表示"不需要/不能重排"，调用方退回 [TdDataSource] 直连。
+     */
+    suspend fun build(mgr: StreamingDownloadManager, fileId: Int, size: Long): Plan? {
+        if (size <= 0L) {
+            PlaybackDiag.plan("direct", "size_unknown")
+            return null
+        }
+        if (size > FASTSTART_MAX_BYTES) {
+            // 方案 B：大文件不在唯一游标上抢尾部，直接顺序流播。
+            PlaybackDiag.plan("direct", "too_large size=$size > $FASTSTART_MAX_BYTES")
+            Log.i(TAG, "file=$fileId size=$size 超过 ${FASTSTART_MAX_BYTES / 1024 / 1024}MB，跳过重排")
+            return null
+        }
+
+        val t0 = SystemClock.elapsedRealtime()
+        var outcome: Outcome? = null
+        val finished = withTimeoutOrNull(PREPARE_PLAN_TIMEOUT_MS) {
+            outcome = try {
+                buildInner(mgr, fileId, size)
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (t: Throwable) {
+                Log.w(TAG, "构建异常 file=$fileId: ${t.message}")
+                Outcome(null, "error:${t.message}")
+            }
+        }
+
+        if (finished == null) {
+            // 超时：prepare 阶段遗留的尾部请求必须收掉，交棒 TdDataSource 前保持游标干净。
+            val ms = SystemClock.elapsedRealtime() - t0
+            PlaybackDiag.plan("timeout", "prepare>${PREPARE_PLAN_TIMEOUT_MS}ms (${ms}ms)")
+            Log.w(TAG, "file=$fileId 规划超时（${ms}ms），退回直连")
+            runCatching { mgr.abortPending(fileId) }
+            return null
+        }
+
+        val o = outcome ?: Outcome(null, "no_outcome")
+        val ms = SystemClock.elapsedRealtime() - t0
+        if (o.plan != null) {
+            PlaybackDiag.plan("remux", "${o.reason} (${ms}ms)")
+            PlaybackDiag.planDetail(
+                moovStart = o.plan.moovStart,
+                moovLen = o.plan.moovLen,
+                prefixLen = o.plan.prefixLen,
+                virtualSize = o.plan.virtualSize,
+            )
+        } else {
+            PlaybackDiag.plan("direct", "${o.reason} (${ms}ms)")
+        }
+        return o.plan
+    }
+
+    private suspend fun buildInner(
+        mgr: StreamingDownloadManager,
+        fileId: Int,
+        size: Long,
+    ): Outcome {
+        val chain = ArrayList<String>(8)
+        var pos = 0L
+        var prefixLen = 0L
+        var moov: Box? = null
+        var broken = false
+        var hops = 0
+
+        while (hops < MAX_BOX_HOPS) {
+            if (pos + 8 > size) {
+                // 剩余不足一个 header：链在文件尾正常结束（未找到 moov）
+                chain.add("eof@$pos")
+                break
+            }
+            val hdr = readReal(mgr, fileId, pos, HEADER_BYTES)
+            val box = parseHeader(hdr, pos)
+            if (box == null || box.size < 8L || box.end > size) {
+                chain.add("bad@$pos")
+                broken = true
+                break
+            }
+            chain.add("${box.type}@${box.start}+${box.size}")
+            hops++
+            when {
+                box.type == "moov" -> {
+                    moov = box
+                    break
+                }
+                box.type == "mdat" -> pos = box.end
+                else -> {
+                    if (box.type in PREFIX_TYPES && prefixLen == box.end) {
+                        // 连续的前缀 box：记录虚拟布局的插入点
+                    }
+                    pos = box.end
+                }
+            }
+            if (box.type in PREFIX_TYPES) prefixLen = box.end
+            if (pos >= size) break
+        }
+
+        PlaybackDiag.boxChain(chain)
+
+        if (moov == null) {
+            if (broken) {
+                // header 链断裂 → 回退旧策略（拉尾部 8MB 搜签名）
+                Log.w(TAG, "header 链断裂，回退尾部扫描 file=$fileId")
+                return trailingScan(mgr, fileId, size)
+            }
+            return Outcome(null, "moov_not_after_mdat")
+        }
+        if (moov.start == 0L) return Outcome(null, "moov_at_0")
+        if (moov.end != size) {
+            // moov 不在文件尾：不需要重排（extractor 不会 seek 到尾部）
+            return Outcome(null, "moov_not_at_tail start=${moov.start} end=${moov.end}")
+        }
+        if (prefixLen <= 0L || prefixLen >= moov.start) {
+            // 没有可用的前缀区（moov 紧贴文件头/前缀异常）：虚拟布局无从构建
+            return Outcome(null, "no_prefix prefixLen=$prefixLen moovStart=${moov.start}")
+        }
+
+        val moovBytes = readReal(mgr, fileId, moov.start, moov.size)
+        if (moovBytes.size.toLong() != moov.size) {
+            return Outcome(null, "moov_short read=${moovBytes.size} want=${moov.size}")
+        }
+
+        // moov 从文件尾挪到 prefixLen 处，mdat 整体后移 moovLen：所有 chunk 偏移 +moovLen
+        patchChunkOffsets(moovBytes, 0, moovBytes.size, moov.size)
+
+        return Outcome(
+            Plan(fileId, size, prefixLen, moovBytes, moov.start),
+            "moov_at_tail hops=$hops prefix=$prefixLen",
+        )
+    }
+
+    /** 回退：拉最后 [TAIL_SCAN_BYTES] 找"正好以文件尾结束"的顶层 box。 */
+    private suspend fun trailingScan(
+        mgr: StreamingDownloadManager,
+        fileId: Int,
+        size: Long,
+    ): Outcome {
         val prefix = readReal(mgr, fileId, 0L, 64L)
-        if (prefix.size < 16) { Log.w(TAG, "prefix 太短"); return null }
-        val prefixLen = topLevelEnd(prefix, 0L, size) ?: run { Log.w(TAG, "topLevelEnd 解析失败"); return null }
-        if (prefixLen <= 0L || prefixLen >= size) { Log.w(TAG, "prefixLen 非法"); return null }
+        if (prefix.size < 16) return Outcome(null, "fallback:prefix_short")
+        val prefixLen = topLevelEnd(prefix) ?: return Outcome(null, "fallback:no_ftyp")
+        if (prefixLen <= 0L || prefixLen >= size) return Outcome(null, "fallback:prefix_bad")
 
         val tailLen = minOf(size, TAIL_SCAN_BYTES)
         val tailStart = size - tailLen
         val tail = readReal(mgr, fileId, tailStart, tailLen)
-        if (tail.size < 16) { Log.w(TAG, "tail 太短"); return null }
+        if (tail.size < 16) return Outcome(null, "fallback:tail_short")
 
         val moovBox = findTrailingBox(tail, tailStart, size)
-        if (moovBox == null) { Log.w(TAG, "未找到以文件尾结束的顶层 box"); return null }
-        if (moovBox.type != "moov") { Log.w(TAG, "尾部 box 不是 moov"); return null }
+            ?: return Outcome(null, "fallback:no_trailing_box")
+        if (moovBox.type != "moov") return Outcome(null, "fallback:tail_is_${moovBox.type}")
 
         val moovBytes = readReal(mgr, fileId, moovBox.start, moovBox.size)
-        if (moovBytes.size.toLong() != moovBox.size) return null
-
-        // moov 从文件尾挪到 prefixLen 处，mdat 整体后移 moovLen：所有 chunk 偏移 +moovLen
+        if (moovBytes.size.toLong() != moovBox.size) {
+            return Outcome(null, "fallback:moov_short")
+        }
         patchChunkOffsets(moovBytes, 0, moovBytes.size, moovBox.size)
+        return Outcome(
+            Plan(fileId, size, prefixLen, moovBytes, moovBox.start),
+            "fallback:trailing_scan",
+        )
+    }
 
-        return Plan(fileId, size, prefixLen, moovBytes, moovBox.start)
+    /** 解析 16 字节 header（含 64 位 largesize 情况）。 */
+    private fun parseHeader(hdr: ByteArray, absoluteStart: Long): Box? {
+        if (hdr.size < 8) return null
+        var s = beInt(hdr, 0).toLong()
+        val type = String(hdr, 4, 4, Charsets.ISO_8859_1)
+        if (type.any { it.code < 0x20 || it.code > 0x7e }) return null
+        if (s == 1L) {
+            if (hdr.size < 16) return null
+            s = beLong(hdr, 8)
+        } else if (s == 0L) {
+            // size=0 表示"一直到文件尾"，由调用方按 end>fileSize 判断裂
+            return null
+        }
+        return Box(absoluteStart, s, type)
     }
 
     /** 从缓冲的尾部数据里找出"正好以文件尾结束"的顶层 box。 */
@@ -110,23 +301,8 @@ object FaststartRemuxer {
         return null
     }
 
-    private fun readBoxAt(buf: ByteArray, i: Int, absoluteStart: Long, fileSize: Long): Box? {
-        if (i + 8 > buf.size) return null
-        var s = beInt(buf, i).toLong()
-        val type = String(buf, i + 4, 4, Charsets.ISO_8859_1)
-        if (type.any { it.code < 0x20 || it.code > 0x7e }) return null
-        var header = 8L
-        if (s == 1L) {
-            if (i + 16 > buf.size) return null
-            s = beLong(buf, i + 8)
-            header = 16L
-        }
-        if (s < header) return null
-        return Box(absoluteStart, s, type)
-    }
-
-    /** 第一个顶层 box 的结束位置。 */
-    private fun topLevelEnd(buf: ByteArray, pos: Long, fileSize: Long): Long? {
+    /** 第一个顶层 box 的结束位置（回退路径用）。 */
+    private fun topLevelEnd(buf: ByteArray): Long? {
         var s = beInt(buf, 0).toLong()
         val type = String(buf, 4, 4, Charsets.ISO_8859_1)
         var header = 8L
@@ -135,7 +311,7 @@ object FaststartRemuxer {
             s = beLong(buf, 8)
             header = 16L
         }
-        if (s < header || (type != "ftyp" && type != "free" && type != "skip")) return null
+        if (s < header || type !in PREFIX_TYPES) return null
         return s
     }
 
@@ -154,8 +330,8 @@ object FaststartRemuxer {
             }
             if (size < header || p + size > end) return
             when (type) {
-                "stco" -> patchStco(buf, p + header, p + size.toInt(), 0, delta)
-                "co64" -> patchStco(buf, p + header, p + size.toInt(), 0, delta)
+                "stco" -> patchStco(buf, p + header, p + size.toInt(), delta)
+                "co64" -> patchStco(buf, p + header, p + size.toInt(), delta)
                 else -> patchChunkOffsets(buf, p + header, p + size.toInt(), delta)
             }
             p += size.toInt()
@@ -163,11 +339,12 @@ object FaststartRemuxer {
     }
 
     /** stco: version/flags(4) + entryCount(4) + 32bit 偏移；co64: 64bit 偏移。 */
-    private fun patchStco(buf: ByteArray, body: Int, end: Int, unused: Int, delta: Long) {
+    private fun patchStco(buf: ByteArray, body: Int, end: Int, delta: Long) {
         if (body + 8 > end) return
         val count = beInt(buf, body + 4)
+        if (count < 0) return
         var p = body + 8
-        // 32/64 位由父级类型决定：靠条目数×宽度校验来推断
+        // 32/64 位由条目数×宽度校验来推断
         val wide = (end - p) / 8 == count && (end - p) % 8 == 0
         repeat(count) {
             if (wide) {
@@ -212,18 +389,20 @@ object FaststartRemuxer {
         b[i + 7] = v.toByte()
     }
 
-    /** 从真实文件读一段（经由 StreamingDownloadManager 落盘窗口）。 */
+    /**
+     * 从真实文件读一段（经由 StreamingDownloadManager 落盘窗口）。
+     * 要求整段已落盘（含末尾），否则 moov 尾部会是 TDLib 预分配的全零。
+     */
     private suspend fun readReal(
         mgr: StreamingDownloadManager,
         fileId: Int,
         offset: Long,
         length: Long,
     ): ByteArray {
-        val ref = mgr.ensureRange(fileId, offset, length)
+        val ref = mgr.ensureRange(fileId, offset, length, tag = "prepare", requireEnd = true)
         val out = ByteArray(length.toInt())
         RandomAccessFile(ref.partialPath, "r").use { raf ->
-            val refLen = File(ref.partialPath).length()
-            raf.seek(if (refLen >= offset + length) offset else offset - ref.globalOffset)
+            raf.seek(offset - ref.globalOffset)
             var got = 0
             while (got < out.size) {
                 val n = raf.read(out, got, out.size - got)

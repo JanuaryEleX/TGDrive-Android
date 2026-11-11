@@ -79,6 +79,7 @@ import com.yg.tgdrive.ServiceLocator
 import com.yg.tgdrive.data.MediaEntity
 import com.yg.tgdrive.data.PlaybackProgressEntity
 import com.yg.tgdrive.download.FaststartRemuxer
+import com.yg.tgdrive.download.PlaybackDiag
 import com.yg.tgdrive.ui.common.AppIcons
 import com.yg.tgdrive.download.TdDataSource
 import com.yg.tgdrive.download.TdDataSourceFactory
@@ -169,6 +170,9 @@ class PlayerActivity : ComponentActivity() {
     internal val currentFileId = mutableStateOf(0)
     internal val bufferedFraction = mutableStateOf(0f)
     internal val isLocalSource = mutableStateOf(false)
+
+    /** 大文件未做 faststart 重排（moov 可能在尾部）：错误覆盖层给「离线下载」入口。 */
+    internal val needsFullDownload = mutableStateOf(false)
 
     private var controlsHideJob: Job? = null
     private var hudClearJob: Job? = null
@@ -270,6 +274,7 @@ class PlayerActivity : ComponentActivity() {
         // 退后台立刻停掉在飞下载，避免"退出后仍在下载"（onDestroy 再兜底硬取消一次）
         ServiceLocator.downloadManager.cancelAll()
         lifecycleScope.launch { persistProgress() }
+        dumpDiag()
     }
 
     override fun onDestroy() {
@@ -315,17 +320,20 @@ class PlayerActivity : ComponentActivity() {
         }
         val p = player ?: return
 
-        // ① LRU 完整缓存命中：本地文件直连起播，零 TDLib 下载，加载即完成。
-        //    完整文件本地播放无需 faststart 重排（moov 本就在文件里），
-        //    跳过 FaststartRemuxer —— 那一步每次都要同步拉文件头+文件尾，是"加载慢"主因。
-        // 本地完整文件直连：① app LRU 缓存 ② TDLib 已完整下载的最终文件。
-        // 二者都是完整本地文件，普通 FileDataSource 直接随机读即可（moov-at-tail 也能按
-        // 绝对偏移正确 seek），零 TDLib 下载、跳过 FaststartRemuxer —— 是"加载慢"的主要优化。
+        val prepareT0 = android.os.SystemClock.elapsedRealtime()
+        PlaybackDiag.begin(mediaId, fileId, entity.size)
+        needsFullDownload.value = false
+
+        // ① 本地完整文件直连：app LRU 缓存 / TDLib 已完整下载的最终文件。
+        //    完整文件本地随机读无需 faststart 重排（moov-at-tail 也能按绝对偏移正确 seek），
+        //    零 TDLib 下载、零 prepare 远距离读。
         val localCache = entity.fileUniqueId?.takeIf { it.isNotBlank() }
             ?.let { ServiceLocator.downloadManager.cacheDirFor(it) }
             ?: ServiceLocator.downloadManager.completedLocalFile(fileId)
         isLocalSource.value = localCache != null && localCache.length() > 0L
         if (localCache != null && localCache.length() > 0L) {
+            PlaybackDiag.source("local")
+            PlaybackDiag.prepareDone(android.os.SystemClock.elapsedRealtime() - prepareT0, false)
             p.setMediaSource(
                 ProgressiveMediaSource.Factory(androidx.media3.datasource.DefaultDataSource.Factory(this))
                     .createMediaSource(
@@ -338,6 +346,7 @@ class PlayerActivity : ComponentActivity() {
                 .build()
             // moov 在文件尾的 MP4：先做 faststart 虚拟重排（IO 线程），否则 Mp4Extractor
             // 会 seek 到尾部读 moov 并把采样偏移二次叠加 → 越界 EOF。
+            // build 内部有 15s 硬上限 + 大小分流，超时/过大一律返回 null → TdDataSource 直连。
             val plan = if (entity.size > 0L) {
                 withContext(Dispatchers.IO) {
                     FaststartRemuxer.build(ServiceLocator.downloadManager, fileId, entity.size)
@@ -345,9 +354,20 @@ class PlayerActivity : ComponentActivity() {
             } else {
                 null
             }
+            PlaybackDiag.prepareDone(
+                android.os.SystemClock.elapsedRealtime() - prepareT0,
+                PlaybackDiag.wasPrepareTimedOut(),
+            )
             val factory: androidx.media3.datasource.DataSource.Factory = if (plan != null) {
+                PlaybackDiag.source("td_virtual")
                 TdVirtualDataSourceFactory(ServiceLocator.downloadManager, plan)
             } else {
+                PlaybackDiag.source("td_data")
+                // 大文件（> FASTSTART_MAX_BYTES）不做重排：moov 在文件尾时首播必然失败，
+                // 明确告知用户并给离线下载入口，而不是让人对着黑屏等。
+                needsFullDownload.value =
+                    entity.size > FaststartRemuxer.FASTSTART_MAX_BYTES &&
+                    entity.mime?.contains("mp4", ignoreCase = true) != false
                 TdDataSourceFactory(ServiceLocator.downloadManager)
             }
             p.setMediaSource(ProgressiveMediaSource.Factory(factory).createMediaSource(mediaItem))
@@ -427,6 +447,20 @@ class PlayerActivity : ComponentActivity() {
         errorText.value = null
         loading.value = true
         lifecycleScope.launch { preparePlayer(initial = false) }
+    }
+
+    /** 大文件 moov-at-tail 首播失败时：把该媒体排进离线下载（整文件落盘后可播）。 */
+    fun enqueueOffline() {
+        val e = item ?: return
+        ServiceLocator.offlineDownloads.enqueue(e)
+        Toast.makeText(this, "已加入离线下载，完成后可播放", Toast.LENGTH_SHORT).show()
+        finish()
+    }
+
+    /** 播放页收尾：落一份 play-diag.json（写失败不影响退出）。 */
+    private fun dumpDiag() {
+        // appScope：onStop→onDestroy 之间 lifecycleScope 会被取消，用应用级 scope 保证落盘。
+        ServiceLocator.appScope.launch { PlaybackDiag.finish(applicationContext) }
     }
 
     private fun handlePlaybackError(error: PlaybackException) {
@@ -668,6 +702,7 @@ private fun PlayerScreen(activity: PlayerActivity, player: ExoPlayer) {
     val speed by activity.speed
     val fill by activity.fill
     val slowPrepare by activity.slowPrepare
+    val needsFullDownload by activity.needsFullDownload
     val hasPrev by activity.hasPrev
     val hasNext by activity.hasNext
     val queueLabel by activity.queueLabel
@@ -890,6 +925,11 @@ private fun PlayerScreen(activity: PlayerActivity, player: ExoPlayer) {
                     )
                     Spacer(Modifier.height(16.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        if (needsFullDownload) {
+                            TextButton(onClick = { activity.enqueueOffline() }) {
+                                Text("离线下载后播放", color = Color.White)
+                            }
+                        }
                         TextButton(onClick = { activity.retry() }) {
                             Text("重试", color = Color.White)
                         }

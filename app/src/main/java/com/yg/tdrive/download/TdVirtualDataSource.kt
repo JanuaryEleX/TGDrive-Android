@@ -1,7 +1,6 @@
 package com.yg.tgdrive.download
 
 import android.net.Uri
-import android.util.Log
 import androidx.media3.common.C
 import androidx.media3.datasource.BaseDataSource
 import androidx.media3.datasource.DataSource
@@ -25,7 +24,6 @@ class TdVirtualDataSource(
 ) : BaseDataSource(true) {
 
     companion object {
-        private const val TAG = "TdVirtual"
         private const val PREHEAT = 512L * 1024
     }
 
@@ -36,7 +34,6 @@ class TdVirtualDataSource(
 
     private var raf: RandomAccessFile? = null
     private var rafPath: String? = null
-    private var rafBase = -1L
 
     override fun getUri(): Uri? = uri
 
@@ -78,12 +75,11 @@ class TdVirtualDataSource(
                 continue
             }
             val real = plan.toReal(position)
-            val limitReal = if (position < plan.prefixLen) plan.prefixLen - 1 + 1 else plan.size
+            val limitReal = if (position < plan.prefixLen) plan.prefixLen else plan.size
             val chunkLen = minOf(remaining.toLong(), limitReal - real).coerceAtLeast(1L)
             val ref = ensure(real, maxOf(chunkLen, PREHEAT))
             val handle = handleFor(ref)
-            val refLen = File(ref.partialPath).length()
-            handle.seek(if (refLen >= plan.size) real else real - ref.globalOffset)
+            handle.seek(real - ref.globalOffset)
             val n = handle.read(buffer, bufOff, chunkLen.toInt())
             if (n <= 0) {
                 if (total == 0) throw IOException("虚拟读取 EOF file=${plan.fileId} vpos=$position real=$real")
@@ -104,13 +100,12 @@ class TdVirtualDataSource(
         runCatching { raf?.close() }
         raf = null
         rafPath = null
-        rafBase = -1L
         uri = null
         transferEnded()
     }
 
     private fun ensure(real: Long, len: Long): PartialRef = try {
-        runBlocking { mgr.ensureRange(plan.fileId, real, len) }
+        runBlocking { mgr.ensureRange(plan.fileId, real, len, tag = "stream") }
     } catch (ie: InterruptedException) {
         Thread.currentThread().interrupt()
         throw IOException("读取被取消 file=${plan.fileId}", ie)
@@ -119,14 +114,10 @@ class TdVirtualDataSource(
     private fun handleFor(ref: PartialRef): RandomAccessFile {
         val existing = raf
         if (existing != null && rafPath == ref.partialPath) return existing
-        if (ref.globalOffset + File(ref.partialPath).length() <= ref.globalOffset) {
-            throw IOException("窗口文件为空 ${ref.partialPath}")
-        }
         runCatching { existing?.close() }
         val f = RandomAccessFile(ref.partialPath, "r")
         raf = f
         rafPath = ref.partialPath
-        rafBase = ref.globalOffset
         return f
     }
 }
