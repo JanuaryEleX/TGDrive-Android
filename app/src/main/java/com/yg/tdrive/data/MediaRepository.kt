@@ -7,6 +7,7 @@ import androidx.paging.PagingConfig
 import androidx.paging.PagingData
 import com.yg.tgdrive.td.TdClient
 import com.yg.tgdrive.td.tdObj
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -177,6 +178,7 @@ class MediaRepository(
             driveDao.setLastScannedMessageId(driveId, newestId)
             driveDao.setScanState(driveId, ScanState.DONE)
         } catch (t: Throwable) {
+            if (t is CancellationException) throw t
             Log.e(TAG, "fullScan drive=$driveId failed", t)
             driveDao.setScanState(driveId, ScanState.ERROR)
         } finally {
@@ -269,6 +271,7 @@ class MediaRepository(
             driveDao.setLastScannedMessageId(driveId, newestId)
             driveDao.setScanState(driveId, ScanState.DONE)
         } catch (t: Throwable) {
+            if (t is CancellationException) throw t
             Log.e(TAG, "incrementalSync drive=$driveId failed", t)
             driveDao.setScanState(driveId, ScanState.ERROR)
         } finally {
@@ -550,6 +553,7 @@ class MediaRepository(
             }
             fileId
         } catch (t: Throwable) {
+            if (t is CancellationException) throw t
             Log.w(TAG, "freshFileId msg=${item.messageId} failed", t)
             mediaDao.setStale(item.id, true)
             -1
