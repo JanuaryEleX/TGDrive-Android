@@ -141,6 +141,11 @@ object ServiceLocator {
                 concurrency = settings.concurrency,
                 cacheDir = app.cacheDir
             )
+            // 设置页缓存上限滑杆（1~64GB）热更到 LRU 逐出阈值。
+            // 此前只写偏好、从不读取下载层，用户把上限调到 64GB 仍按常量 4GB 逐出。
+            appScope.launch {
+                settings.cacheCapGb.collect { gb -> downloadManager.setCacheCapGb(gb.toLong()) }
+            }
             // 设置页"清空缓存"：缩略图目录由 MediaRepository 清，LRU 缓存经钩子委托下载层
             mediaRepository.clearCacheHook = { downloadManager.clearCache() }
             // 设置页"重扫"：DriveManager 桥接到 MediaRepository.incrementalSync
