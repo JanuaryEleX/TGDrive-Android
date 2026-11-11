@@ -3,6 +3,7 @@ package com.yg.tgdrive.settings
 import android.content.Context
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
@@ -30,6 +31,12 @@ class SettingsStore(private val context: Context) {
         val proxyUser = stringPreferencesKey("proxy_user")
         val proxyPass = stringPreferencesKey("proxy_pass")
         val shareDefaultDrive = stringPreferencesKey("share_default_drive")
+        val playerSpeed = floatPreferencesKey("player_speed")
+        val playerFill = intPreferencesKey("player_fill")
+        val librarySort = stringPreferencesKey("library_sort")
+        val librarySortDesc = booleanPreferencesKey("library_sort_desc")
+        val themeMode = stringPreferencesKey("theme_mode")          // system|light|dark
+        val downloadStoreMode = stringPreferencesKey("download_store_mode") // private|public
     }
 
     // ---- 明文 ----
@@ -55,6 +62,51 @@ class SettingsStore(private val context: Context) {
         context.dataStore.data.map { it[K.shareDefaultDrive] }
     suspend fun setShareDefaultDrive(chatId: String) =
         context.dataStore.edit { it[K.shareDefaultDrive] = chatId }
+
+    // ---- 播放器 / 列表偏好（P0：倍速与填充全局记忆；P1：排序全局记忆） ----
+
+    /** 播放倍速，0.5~2.0，默认 1.0（长按临时 2x 不写入这里）。 */
+    val playerSpeed: Flow<Float> = context.dataStore.data.map {
+        (it[K.playerSpeed] ?: 1f).coerceIn(0.5f, 2f)
+    }
+    suspend fun setPlayerSpeed(v: Float) =
+        context.dataStore.edit { it[K.playerSpeed] = v.coerceIn(0.5f, 2f) }
+
+    /** 画面填充：0 适应 / 1 裁切 / 2 拉伸 / 3 原始，默认 0。 */
+    val playerFill: Flow<Int> = context.dataStore.data.map {
+        (it[K.playerFill] ?: 0).coerceIn(0, 3)
+    }
+    suspend fun setPlayerFill(v: Int) =
+        context.dataStore.edit { it[K.playerFill] = v.coerceIn(0, 3) }
+
+    /** 列表排序维度：date|duration|size|name，默认 date。 */
+    val librarySort: Flow<String> = context.dataStore.data.map {
+        (it[K.librarySort] ?: "date").takeIf { s -> s in setOf("date", "duration", "size", "name") } ?: "date"
+    }
+    suspend fun setLibrarySort(v: String) =
+        context.dataStore.edit { it[K.librarySort] = v }
+
+    /** 排序方向：true = 倒序，默认 true。 */
+    val librarySortDesc: Flow<Boolean> = context.dataStore.data.map {
+        it[K.librarySortDesc] ?: true
+    }
+    suspend fun setLibrarySortDesc(v: Boolean) =
+        context.dataStore.edit { it[K.librarySortDesc] = v }
+
+    /** 主题模式：system|light|dark，默认跟随系统。 */
+    val themeMode: Flow<String> = context.dataStore.data.map {
+        (it[K.themeMode] ?: "system").takeIf { s -> s in setOf("system", "light", "dark") } ?: "system"
+    }
+    suspend fun setThemeMode(v: String) =
+        context.dataStore.edit { it[K.themeMode] = v }
+
+    /** 离线下载存储位置：private（应用私有目录）| public（公共下载目录）。 */
+    val downloadStoreMode: Flow<String> = context.dataStore.data.map {
+        (it[K.downloadStoreMode] ?: "private")
+            .takeIf { m -> m in setOf("private", "public") } ?: "private"
+    }
+    suspend fun setDownloadStoreMode(v: String) =
+        context.dataStore.edit { it[K.downloadStoreMode] = v }
 
     // ---- 代理 ----
 

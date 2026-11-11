@@ -12,6 +12,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -19,20 +20,24 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
-import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -42,37 +47,49 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.view.WindowCompat
+import android.content.pm.ActivityInfo
+import android.content.res.Configuration
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.lifecycleScope
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
+import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
+import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import com.yg.tgdrive.ServiceLocator
 import com.yg.tgdrive.data.MediaEntity
 import com.yg.tgdrive.data.PlaybackProgressEntity
-import com.yg.tgdrive.download.StreamingDownloadManager
+import com.yg.tgdrive.download.FaststartRemuxer
+import com.yg.tgdrive.ui.common.AppIcons
 import com.yg.tgdrive.download.TdDataSource
 import com.yg.tgdrive.download.TdDataSourceFactory
+import com.yg.tgdrive.download.TdVirtualDataSourceFactory
 import com.yg.tgdrive.ui.common.AppTheme
 import com.yg.tgdrive.ui.common.formatDuration
+import com.yg.tgdrive.ui.common.formatSize
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -81,27 +98,37 @@ import kotlin.math.abs
 import kotlin.math.roundToInt
 
 /**
- * 播放页（SPEC §4.4 / 任务书 C）：
- * - Compose setContent + AndroidView(PlayerView)，全屏横屏（manifest: sensorLandscape + 黑底主题）
- * - mediaId（Intent extra "mediaId"）→ mediaDao.getById → freshFileId 重取 →
- *   ExoPlayer + ProgressiveMediaSource(TdDataSourceFactory)
- * - 续播：position > 30s 且未 finished → seekTo + Toast
- * - 手势包：左右横滑 ±15s（中央预览浮层）/ 左半竖滑亮度 / 右半竖滑音量 /
- *   双击左右半屏 ±10s / 长按 2x 松手恢复 / 锁屏按钮锁全部手势
- * - 进度每 5s 节流 + onPause + 播完(≥95%) → playbackProgressDao.upsert
- * - 错误覆盖层（文案 + 重试）；onDestroy: downloadManager.cancelAll + player.release()
+ * 播放页（P0 体验重做）。
+ *
+ * - 时间轴：控制层收起时底部常驻 2dp 细进度条；点屏展开完整控制层（可拖 Slider）
+ * - 倍速：6 档 + 全局记忆（SettingsStore.playerSpeed），长按临时 2x 松手回原速
+ * - 填充：适应/裁切/拉伸/原始 四档循环 + 全局记忆（SettingsStore.playerFill）
+ * - 自动隐藏：播放中 3s 收起；暂停/出错常显
+ * - 锁屏：锁定后所有控件（含细条）隐藏，只留解锁钮
+ * - 元信息：标题 + 分辨率 + 大小 + 非默认状态标签
+ * - 首帧：准备中显示提示，超 10s 可取消返回
+ * - 错误：自动退避重试 2 次 → 中文原因 + 手动重试
+ * - 上下集：按发起播放时的列表（queue）顺序手动切，绝不自动连播
+ * - 熄屏/切后台即暂停（不做后台播放，不引 MediaSession）
  */
 class PlayerActivity : ComponentActivity() {
 
     companion object {
         internal const val TAG = "PlayerActivity"
         internal const val EXTRA_MEDIA_ID = "mediaId"
+        internal const val EXTRA_QUEUE = "queue"
+        internal const val EXTRA_INDEX = "index"
         internal const val RESUME_MIN_MS = 30_000L
         internal const val FINISHED_RATIO = 0.95
-        internal const val SEEK_SWEEP_SECONDS = 15f   // 全屏宽横滑 = ±15s
+        internal const val SEEK_SWEEP_SECONDS = 15f
         internal const val DOUBLE_TAP_STEP_MS = 10_000L
-        internal const val CONTROLS_HIDE_MS = 3_500L
+        internal const val CONTROLS_HIDE_MS = 3_000L
         internal const val PROGRESS_TICK_MS = 5_000L
+        internal const val UI_TICK_MS = 400L
+        internal const val MAX_AUTO_RETRY = 2
+        internal const val SLOW_PREPARE_MS = 10_000L
+        internal val SPEEDS = floatArrayOf(0.5f, 0.75f, 1f, 1.25f, 1.5f, 2f)
+        internal val FILL_LABELS = arrayOf("适应", "裁切", "拉伸", "原始")
     }
 
     private var player: ExoPlayer? = null
@@ -109,48 +136,124 @@ class PlayerActivity : ComponentActivity() {
     private var item: MediaEntity? = null
     private var audioManager: AudioManager? = null
     private var maxVolume = 1
-    private var savedSpeed = 1f
-    private var speedBoosted = false
 
-    // Compose 可观察状态（主线程读写；顶层 PlayerScreen composable 读取）
+    /** 全局记忆的倍速（长按 2x 不写入） */
+    private var baseSpeed = 1f
+    private var speedBoosted = false
+    private var fillMode = 0
+    private var autoRetry = 0
+    private var preparing = false
+    private var queue: LongArray = LongArray(0)
+    private var queueIndex = -1
+
     internal val title = mutableStateOf("")
+    internal val metaLine = mutableStateOf("")
+    internal val stateTag = mutableStateOf("")
     internal val errorText = mutableStateOf<String?>(null)
     internal val loading = mutableStateOf(true)
+    internal val prepared = mutableStateOf(false)
+    internal val buffering = mutableStateOf(false)
+    internal val playing = mutableStateOf(false)
+    internal val positionMs = mutableStateOf(0L)
+    internal val durationMs = mutableStateOf(0L)
     internal val controlsVisible = mutableStateOf(true)
     internal val locked = mutableStateOf(false)
     internal val seekPreview = mutableStateOf<String?>(null)
     internal val hudText = mutableStateOf<String?>(null)
+    internal val speed = mutableStateOf(1f)
+    internal val fill = mutableStateOf(0)
+    internal val slowPrepare = mutableStateOf(false)
+    internal val hasPrev = mutableStateOf(false)
+    internal val hasNext = mutableStateOf(false)
+    internal val queueLabel = mutableStateOf("")
+    internal val currentFileId = mutableStateOf(0)
+    internal val bufferedFraction = mutableStateOf(0f)
+    internal val isLocalSource = mutableStateOf(false)
 
     private var controlsHideJob: Job? = null
     private var hudClearJob: Job? = null
+    private var slowPrepareJob: Job? = null
 
     private val playerListener = object : Player.Listener {
-        override fun onPlayerError(error: PlaybackException) {
-            errorText.value = describeError(error)
-        }
+        override fun onPlayerError(error: PlaybackException) = handlePlaybackError(error)
 
         override fun onPlaybackStateChanged(playbackState: Int) {
-            if (playbackState == Player.STATE_ENDED) {
-                lifecycleScope.launch { persistProgress(finished = true) }
+            when (playbackState) {
+                Player.STATE_BUFFERING -> buffering.value = true
+                Player.STATE_READY -> {
+                    buffering.value = false
+                    prepared.value = true
+                    loading.value = false
+                    autoRetry = 0
+                    preparing = false
+                    slowPrepare.value = false
+                    slowPrepareJob?.cancel()
+                    player?.setPlaybackSpeed(baseSpeed)
+                }
+                Player.STATE_ENDED -> {
+                    buffering.value = false
+                    lifecycleScope.launch { persistProgress(finished = true) }
+                    pokeControls(true)
+                }
+                else -> Unit
             }
+        }
+
+        override fun onIsPlayingChanged(isPlaying: Boolean) {
+            playing.value = isPlaying
+            if (isPlaying) scheduleHide() else pokeControls(true)
+        }
+
+        override fun onPlaybackParametersChanged(playbackParameters: PlaybackParameters) {
+            speed.value = playbackParameters.speed
+            refreshTag()
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         mediaId = intent.getLongExtra(EXTRA_MEDIA_ID, -1L)
+        queue = intent.getLongArrayExtra(EXTRA_QUEUE) ?: LongArray(0)
+        queueIndex = intent.getIntExtra(EXTRA_INDEX, -1)
         audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         maxVolume = audioManager?.getStreamMaxVolume(AudioManager.STREAM_MUSIC) ?: 1
 
         val p = ExoPlayer.Builder(this).build().also { it.addListener(playerListener) }
         player = p
 
-        // 每 5s 节流保存进度
         lifecycleScope.launch {
             while (isActive) {
                 delay(PROGRESS_TICK_MS)
                 if (p.isPlaying) persistProgress()
             }
+        }
+        lifecycleScope.launch {
+            while (isActive) {
+                delay(UI_TICK_MS)
+                val dur = p.duration
+                durationMs.value = if (dur > 0) dur else 0L
+                positionMs.value = p.currentPosition.coerceAtLeast(0L)
+                // 缓存进度 = 已落盘字节 / 总字节（整文件本地直连时=100%）。
+                // 无会话（本地直连/虚拟重排早期）时退回 ExoPlayer bufferedPosition。
+                val fid = currentFileId.value
+                val total = if (fid > 0) ServiceLocator.downloadManager.totalBytes(fid) else 0L
+                val done = if (fid > 0) ServiceLocator.downloadManager.bufferedBytes(fid) else 0L
+                val durF = if (dur > 0) dur.toFloat() else 1f
+                bufferedFraction.value = when {
+                    isLocalSource.value -> 1f
+                    total > 0L -> (done.toFloat() / total).coerceIn(0f, 1f)
+                    else -> (p.bufferedPosition.coerceAtLeast(p.currentPosition).toFloat() / durF).coerceIn(0f, 1f)
+                }
+            }
+        }
+        lifecycleScope.launch {
+            baseSpeed = runCatching { ServiceLocator.settings.playerSpeed.first() }.getOrDefault(1f)
+            fillMode = runCatching { ServiceLocator.settings.playerFill.first() }.getOrDefault(0)
+            speed.value = baseSpeed
+            fill.value = fillMode
+            p.setPlaybackSpeed(baseSpeed)
+            refreshTag()
+            preparePlayer(initial = true)
         }
 
         setContent {
@@ -158,11 +261,14 @@ class PlayerActivity : ComponentActivity() {
                 PlayerScreen(activity = this, player = p)
             }
         }
-        lifecycleScope.launch { preparePlayer(initial = true) }
     }
 
-    override fun onPause() {
-        super.onPause()
+    override fun onStop() {
+        super.onStop()
+        // 熄屏 / 切后台即暂停（设计决策：不做后台播放）
+        player?.pause()
+        // 退后台立刻停掉在飞下载，避免"退出后仍在下载"（onDestroy 再兜底硬取消一次）
+        ServiceLocator.downloadManager.cancelAll()
         lifecycleScope.launch { persistProgress() }
     }
 
@@ -173,7 +279,7 @@ class PlayerActivity : ComponentActivity() {
         player = null
     }
 
-    // ═══════════════════════ 装配 / 进度 ═══════════════════════
+    // ═══════════════════════ 装配 ═══════════════════════
 
     private suspend fun preparePlayer(initial: Boolean) {
         val dao = ServiceLocator.appDatabase.mediaDao()
@@ -184,36 +290,68 @@ class PlayerActivity : ComponentActivity() {
             return
         }
         title.value = entity.displayName
+        metaLine.value = buildMeta(entity)
         errorText.value = null
+        prepared.value = false
+        buffering.value = true
+        loading.value = true
+        preparing = true
+        slowPrepare.value = false
+        slowPrepareJob?.cancel()
+        slowPrepareJob = lifecycleScope.launch {
+            delay(SLOW_PREPARE_MS)
+            if (preparing) slowPrepare.value = true
+        }
+        refreshQueueState()
+
         val fileId = ServiceLocator.mediaRepository.freshFileId(entity)
+        currentFileId.value = if (fileId > 0) fileId else 0
         if (fileId <= 0) {
+            preparing = false
             errorText.value = "file_id 已失效且重取失败，请刷新媒体库后重试"
             loading.value = false
+            buffering.value = false
             return
         }
         val p = player ?: return
-        val mediaItem = MediaItem.Builder()
-            .setUri(TdDataSource.buildUri(fileId, entity.size, entity.fileUniqueId))
-            .build()
-        // moov 在文件尾的 MP4：先做 faststart 虚拟重排（IO 线程，避免主线程等待下载）。
-        // 否则 Mp4Extractor 会 seek 到尾部读 moov，并把采样偏移按尾部基准二次叠加，
-        // 得到 > 文件长度的位置后越界 EOF（Loading finished before preparation）。
-        val plan = if (entity.size > 0L) {
-            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                com.yg.tgdrive.download.FaststartRemuxer.build(
-                    ServiceLocator.downloadManager, fileId, entity.size
-                )
+
+        // ① LRU 完整缓存命中：本地文件直连起播，零 TDLib 下载，加载即完成。
+        //    完整文件本地播放无需 faststart 重排（moov 本就在文件里），
+        //    跳过 FaststartRemuxer —— 那一步每次都要同步拉文件头+文件尾，是"加载慢"主因。
+        // 本地完整文件直连：① app LRU 缓存 ② TDLib 已完整下载的最终文件。
+        // 二者都是完整本地文件，普通 FileDataSource 直接随机读即可（moov-at-tail 也能按
+        // 绝对偏移正确 seek），零 TDLib 下载、跳过 FaststartRemuxer —— 是"加载慢"的主要优化。
+        val localCache = entity.fileUniqueId?.takeIf { it.isNotBlank() }
+            ?.let { ServiceLocator.downloadManager.cacheDirFor(it) }
+            ?: ServiceLocator.downloadManager.completedLocalFile(fileId)
+        isLocalSource.value = localCache != null && localCache.length() > 0L
+        if (localCache != null && localCache.length() > 0L) {
+            p.setMediaSource(
+                ProgressiveMediaSource.Factory(androidx.media3.datasource.DefaultDataSource.Factory(this))
+                    .createMediaSource(
+                        MediaItem.fromUri(android.net.Uri.fromFile(localCache))
+                    )
+            )
+        } else {
+            val mediaItem = MediaItem.Builder()
+                .setUri(TdDataSource.buildUri(fileId, entity.size, entity.fileUniqueId))
+                .build()
+            // moov 在文件尾的 MP4：先做 faststart 虚拟重排（IO 线程），否则 Mp4Extractor
+            // 会 seek 到尾部读 moov 并把采样偏移二次叠加 → 越界 EOF。
+            val plan = if (entity.size > 0L) {
+                withContext(Dispatchers.IO) {
+                    FaststartRemuxer.build(ServiceLocator.downloadManager, fileId, entity.size)
+                }
+            } else {
+                null
             }
-        } else {
-            null
+            val factory: androidx.media3.datasource.DataSource.Factory = if (plan != null) {
+                TdVirtualDataSourceFactory(ServiceLocator.downloadManager, plan)
+            } else {
+                TdDataSourceFactory(ServiceLocator.downloadManager)
+            }
+            p.setMediaSource(ProgressiveMediaSource.Factory(factory).createMediaSource(mediaItem))
         }
-        val factory: androidx.media3.datasource.DataSource.Factory = if (plan != null) {
-            com.yg.tgdrive.download.TdVirtualDataSourceFactory(ServiceLocator.downloadManager, plan)
-        } else {
-            TdDataSourceFactory(ServiceLocator.downloadManager)
-        }
-        val source = ProgressiveMediaSource.Factory(factory).createMediaSource(mediaItem)
-        p.setMediaSource(source)
 
         var resumeMs = 0L
         if (initial) {
@@ -226,15 +364,87 @@ class PlayerActivity : ComponentActivity() {
             p.seekTo(resumeMs)
             Toast.makeText(this, "从 ${formatDuration(resumeMs)} 继续播放", Toast.LENGTH_SHORT).show()
         }
+        p.setPlaybackSpeed(baseSpeed)
         p.prepare()
         p.playWhenReady = true
         loading.value = false
     }
 
+    private fun buildMeta(entity: MediaEntity): String {
+        val parts = mutableListOf<String>()
+        val w = entity.width ?: 0
+        val h = entity.height ?: 0
+        if (w > 0 && h > 0) parts += "${minOf(w, h)}p"
+        if (entity.size > 0) parts += formatSize(entity.size)
+        val d = entity.durationMs ?: 0L
+        if (d > 0) parts += formatDuration(d)
+        return parts.joinToString(" · ")
+    }
+
+    private fun refreshTag() {
+        val parts = mutableListOf<String>()
+        if (abs(speed.value - 1f) > 0.01f) parts += trimSpeed(speed.value)
+        if (fill.value != 0) parts += FILL_LABELS[fill.value.coerceIn(0, 3)]
+        stateTag.value = parts.joinToString(" · ")
+    }
+
+    private fun trimSpeed(v: Float): String =
+        if (kotlin.math.abs(v - v.toInt().toFloat()) < 0.01f) "${v.toInt()}x"
+        else "${v}x"
+
+    private fun refreshQueueState() {
+        hasPrev.value = queue.isNotEmpty() && queueIndex > 0 && queueIndex < queue.size
+        hasNext.value = queue.isNotEmpty() && queueIndex >= 0 && queueIndex < queue.size - 1
+        queueLabel.value = if (queue.isNotEmpty() && queueIndex in queue.indices) {
+            "${queueIndex + 1}/${queue.size}"
+        } else ""
+    }
+
+    // ═══════════════════════ 上下集 ═══════════════════════
+
+    fun playPrev() = switchTo(queueIndex - 1)
+
+    fun playNext() = switchTo(queueIndex + 1)
+
+    private fun switchTo(index: Int) {
+        if (index < 0 || index >= queue.size) return
+        queueIndex = index
+        val target = queue[index]
+        if (target == mediaId) return
+        lifecycleScope.launch {
+            persistProgress()
+            player?.pause()
+            item = null
+            mediaId = target
+            durationMs.value = 0L
+            positionMs.value = 0L
+            preparePlayer(initial = true)
+        }
+    }
+
     fun retry() {
+        autoRetry = 0
         errorText.value = null
         loading.value = true
         lifecycleScope.launch { preparePlayer(initial = false) }
+    }
+
+    private fun handlePlaybackError(error: PlaybackException) {
+        buffering.value = false
+        prepared.value = false
+        preparing = false
+        if (autoRetry < MAX_AUTO_RETRY) {
+            autoRetry++
+            hudText.value = "播放中断，正在重试 $autoRetry/$MAX_AUTO_RETRY"
+            lifecycleScope.launch {
+                delay(1_200L * autoRetry)
+                preparePlayer(initial = false)
+            }
+            return
+        }
+        errorText.value = describeError(error)
+        loading.value = false
+        pokeControls(true)
     }
 
     private suspend fun persistProgress(finished: Boolean = false) {
@@ -258,7 +468,7 @@ class PlayerActivity : ComponentActivity() {
         }
     }
 
-    // ═══════════════════════ 控制条显隐 / 锁定 ═══════════════════════
+    // ═══════════════════════ 控件 / 锁定 ═══════════════════════
 
     fun toggleControls() {
         if (locked.value) return
@@ -268,11 +478,15 @@ class PlayerActivity : ComponentActivity() {
     fun pokeControls(visible: Boolean) {
         controlsVisible.value = visible
         controlsHideJob?.cancel()
-        if (visible && !locked.value) {
-            controlsHideJob = lifecycleScope.launch {
-                delay(CONTROLS_HIDE_MS)
-                controlsVisible.value = false
-            }
+        if (visible && !locked.value && playing.value) scheduleHide()
+    }
+
+    private fun scheduleHide() {
+        controlsHideJob?.cancel()
+        if (locked.value) return
+        controlsHideJob = lifecycleScope.launch {
+            delay(CONTROLS_HIDE_MS)
+            if (playing.value && !locked.value) controlsVisible.value = false
         }
     }
 
@@ -286,7 +500,41 @@ class PlayerActivity : ComponentActivity() {
         }
     }
 
-    // ═══════════════════════ 手势回调（Compose 手势层调用，主线程） ═══════════════════════
+    // ═══════════════════════ 进度 / 播放控制 ═══════════════════════
+
+    fun seekTo(ms: Long) {
+        val dur = player?.duration ?: 0L
+        if (dur <= 0) return
+        player?.seekTo(ms.coerceIn(0L, dur))
+        positionMs.value = ms.coerceIn(0L, dur)
+        pokeControls(true)
+    }
+
+    fun togglePlayPause() {
+        val p = player ?: return
+        if (p.isPlaying) p.pause() else p.play()
+        pokeControls(true)
+    }
+
+    fun pickSpeed(value: Float) {
+        baseSpeed = value
+        speed.value = value
+        player?.setPlaybackSpeed(value)
+        refreshTag()
+        lifecycleScope.launch { ServiceLocator.settings.setPlayerSpeed(value) }
+        pokeControls(true)
+    }
+
+    fun cycleFill() {
+        fillMode = (fillMode + 1) % FILL_LABELS.size
+        fill.value = fillMode
+        refreshTag()
+        lifecycleScope.launch { ServiceLocator.settings.setPlayerFill(fillMode) }
+        flashHud("画面 ${FILL_LABELS[fillMode]}")
+        pokeControls(true)
+    }
+
+    // ═══════════════════════ 手势 ═══════════════════════
 
     fun onDoubleTap(leftHalf: Boolean) {
         val p = player ?: return
@@ -295,12 +543,12 @@ class PlayerActivity : ComponentActivity() {
         val target = (p.currentPosition + if (leftHalf) -DOUBLE_TAP_STEP_MS else DOUBLE_TAP_STEP_MS)
             .coerceIn(0L, dur)
         p.seekTo(target)
+        positionMs.value = target
         flashHud(if (leftHalf) "快退 10 秒" else "快进 10 秒")
     }
 
     fun onSeekDragStart(): Long = player?.currentPosition ?: 0L
 
-    /** 横滑：整屏宽 = ±15s；返回目标时间并更新中央预览浮层。 */
     fun onSeekDrag(baseMs: Long, deltaSeconds: Float, durationMs: Long): Long {
         val target = (baseMs + (deltaSeconds * 1000).toLong()).coerceIn(0L, durationMs)
         val diffSec = (target - baseMs) / 1000
@@ -312,6 +560,7 @@ class PlayerActivity : ComponentActivity() {
     fun onSeekDragEnd(targetMs: Long) {
         seekPreview.value = null
         player?.seekTo(targetMs)
+        positionMs.value = targetMs
     }
 
     fun cancelDragOverlays() {
@@ -319,7 +568,6 @@ class PlayerActivity : ComponentActivity() {
         hudText.value = null
     }
 
-    /** 竖滑起点值：左半屏=亮度基线（系统默认 -1 视为 0.5），右半屏=音量基线 0..1。 */
     fun onVerticalDragStart(leftHalf: Boolean): Float =
         if (leftHalf) {
             window.attributes.screenBrightness.takeIf { it >= 0f } ?: 0.5f
@@ -347,16 +595,15 @@ class PlayerActivity : ComponentActivity() {
     fun onLongPressStart() {
         val p = player ?: return
         if (speedBoosted) return
-        savedSpeed = p.playbackParameters.speed
-        p.setPlaybackSpeed(2f)
         speedBoosted = true
+        p.setPlaybackSpeed(2f)
         flashHud("2x 快进中")
     }
 
     fun onLongPressEnd() {
         if (!speedBoosted) return
         speedBoosted = false
-        player?.setPlaybackSpeed(savedSpeed)
+        player?.setPlaybackSpeed(baseSpeed)
         hudClearJob?.cancel()
         hudText.value = null
     }
@@ -372,23 +619,26 @@ class PlayerActivity : ComponentActivity() {
 
     private fun describeError(e: PlaybackException): String = when (e.errorCode) {
         PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED,
-        PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT,
+        PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT ->
+            "网络中断了，检查网络或代理后重试"
         PlaybackException.ERROR_CODE_IO_UNSPECIFIED ->
-            "网络连接失败，请检查网络或代理设置"
+            "数据读取失败：该位置片段可能还没落盘，重试通常会恢复"
         PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND,
         PlaybackException.ERROR_CODE_IO_READ_POSITION_OUT_OF_RANGE ->
-            "下载数据异常，请重试"
+            "文件位置越界，可能是文件已被删除或换源"
+        PlaybackException.ERROR_CODE_PARSING_CONTAINER_MALFORMED,
+        PlaybackException.ERROR_CODE_PARSING_MANIFEST_MALFORMED ->
+            "文件封装异常（moov 损坏或不是有效 MP4）"
         PlaybackException.ERROR_CODE_DECODING_FAILED,
         PlaybackException.ERROR_CODE_DECODING_FORMAT_EXCEEDS_CAPABILITIES,
         PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED ->
-            "该编码 Media3 硬解不支持，建议转 MP4(H.264+AAC) 后重传"
-        else -> "播放出错（${e.errorCodeName}），点击重试"
+            "这个编码本机硬解不支持，可转 MP4(H.264+AAC) 后重传"
+        else -> "播放失败：${e.errorCodeName}（已自动重试 $MAX_AUTO_RETRY 次）"
     }
 }
 
 // ═══════════════════════ Compose UI ═══════════════════════
 
-/** 手势拖拽进行中的状态（纯可变对象，手势回调内读写，不参与重组）。 */
 private class DragState {
     var horizontal: Boolean? = null
     var leftHalf = false
@@ -404,13 +654,26 @@ private fun PlayerScreen(activity: PlayerActivity, player: ExoPlayer) {
     val locked by activity.locked
     val controlsVisible by activity.controlsVisible
     val title by activity.title
+    val metaLine by activity.metaLine
+    val stateTag by activity.stateTag
     val errorText by activity.errorText
-    val loading by activity.loading
+    val prepared by activity.prepared
+    val buffering by activity.buffering
+    val playing by activity.playing
+    val positionMs by activity.positionMs
+    val durationMs by activity.durationMs
+    val bufferedFraction by activity.bufferedFraction
     val seekPreview by activity.seekPreview
     val hudText by activity.hudText
+    val speed by activity.speed
+    val fill by activity.fill
+    val slowPrepare by activity.slowPrepare
+    val hasPrev by activity.hasPrev
+    val hasNext by activity.hasNext
+    val queueLabel by activity.queueLabel
     val view = LocalView.current
+    val isLandscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
 
-    // 沉浸式全屏
     DisposableEffect(Unit) {
         val window = activity.window
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -425,20 +688,27 @@ private fun PlayerScreen(activity: PlayerActivity, player: ExoPlayer) {
         }
     }
 
-    Box(
-        Modifier
-            .fillMaxSize()
-            .background(Color.Black)
-    ) {
+    Box(Modifier.fillMaxSize().background(Color.Black)) {
         AndroidView(
             factory = { ctx ->
-                PlayerView(ctx).apply { useController = false }
+                PlayerView(ctx).apply {
+                    useController = false
+                    resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
+                }
             },
-            update = { it.player = player },
+            update = { v ->
+                v.player = player
+                v.resizeMode = when (fill) {
+                    1 -> AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+                    2 -> AspectRatioFrameLayout.RESIZE_MODE_FILL
+                    3 -> AspectRatioFrameLayout.RESIZE_MODE_FIXED_WIDTH
+                    else -> AspectRatioFrameLayout.RESIZE_MODE_FIT
+                }
+            },
             modifier = Modifier.fillMaxSize(),
         )
 
-        // 手势层（未锁定时生效；锁定后仅解锁按钮可点）
+        // 手势层（未锁定时生效）
         if (!locked) {
             val dragState = remember { DragState() }
             Box(
@@ -447,9 +717,7 @@ private fun PlayerScreen(activity: PlayerActivity, player: ExoPlayer) {
                     .pointerInput(player) {
                         detectTapGestures(
                             onTap = { activity.toggleControls() },
-                            onDoubleTap = { offset ->
-                                activity.onDoubleTap(offset.x < size.width / 2f)
-                            },
+                            onDoubleTap = { offset -> activity.onDoubleTap(offset.x < size.width / 2f) },
                             onLongPress = { activity.onLongPressStart() },
                             onPress = {
                                 try {
@@ -498,7 +766,7 @@ private fun PlayerScreen(activity: PlayerActivity, player: ExoPlayer) {
                                         st.baseValue,
                                         -st.accumY / size.height,
                                     )
-                                    null -> {}
+                                    null -> Unit
                                 }
                             },
                             onDragEnd = {
@@ -506,7 +774,7 @@ private fun PlayerScreen(activity: PlayerActivity, player: ExoPlayer) {
                                 when (st.horizontal) {
                                     true -> activity.onSeekDragEnd(st.targetMs)
                                     false -> activity.onVerticalDragEnd()
-                                    null -> {}
+                                    null -> Unit
                                 }
                             },
                             onDragCancel = { activity.cancelDragOverlays() },
@@ -515,48 +783,54 @@ private fun PlayerScreen(activity: PlayerActivity, player: ExoPlayer) {
             )
         }
 
-        // 中央预览浮层：横滑 seek 目标时间
-        seekPreview?.let { text ->
-            CenterOverlay(text)
-        }
-        // 中央 HUD：亮度/音量/双击/2x 提示
-        hudText?.let { text ->
-            CenterOverlay(text)
-        }
+        seekPreview?.let { CenterOverlay(it) }
+        hudText?.let { CenterOverlay(it) }
 
-        // 顶部：返回 + 标题 + 锁屏（自动隐藏）
-        if (controlsVisible && !locked) {
-            Row(
-                modifier = Modifier
+        // 常驻细进度条（控制层收起且已有进度时）
+        if (!locked && !controlsVisible && prepared && durationMs > 0) {
+            val frac = (positionMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
+            Box(
+                Modifier
+                    .align(Alignment.BottomStart)
                     .fillMaxWidth()
-                    .background(Color(0x66000000))
-                    .statusBarsPadding()
-                    .padding(horizontal = 4.dp, vertical = 2.dp),
-                verticalAlignment = Alignment.CenterVertically,
+                    .height(2.dp)
+                    .background(Color.White.copy(alpha = 0.18f))
             ) {
-                IconButton(onClick = { activity.finish() }) {
-                    Icon(
-                        Icons.AutoMirrored.Filled.ArrowBack,
-                        contentDescription = "返回",
-                        tint = Color.White,
-                    )
-                }
-                Text(
-                    title,
-                    color = Color.White,
-                    fontSize = 16.sp,
-                    fontWeight = FontWeight.Medium,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f),
+                Box(
+                    Modifier
+                        .fillMaxWidth(frac)
+                        .height(2.dp)
+                        .background(MaterialTheme.colorScheme.primary)
                 )
-                IconButton(onClick = { activity.toggleLock() }) {
-                    LockIcon(locked = false, tint = Color.White)
-                }
             }
         }
 
-        // 锁定态：仅保留解锁按钮
+        if (controlsVisible && !locked) {
+            TopBar(
+                title = title,
+                meta = metaLine,
+                tag = stateTag,
+                onBack = { activity.finish() },
+                onLock = { activity.toggleLock() },
+                isFullscreen = isLandscape,
+                onToggleFullscreen = { toggleFullscreen(activity) },
+                modifier = Modifier.align(Alignment.TopStart),
+            )
+            BottomBar(
+                activity = activity,
+                playing = playing,
+                positionMs = positionMs,
+                durationMs = durationMs,
+                buffered = bufferedFraction,
+                speed = speed,
+                fill = fill,
+                hasPrev = hasPrev,
+                hasNext = hasNext,
+                queueLabel = queueLabel,
+                modifier = Modifier.align(Alignment.BottomStart),
+            )
+        }
+
         if (locked) {
             IconButton(
                 onClick = { activity.toggleLock() },
@@ -569,19 +843,42 @@ private fun PlayerScreen(activity: PlayerActivity, player: ExoPlayer) {
             }
         }
 
-        // 加载中
-        if (loading && errorText == null) {
-            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                CircularProgressIndicator(color = Color.White)
+        // 准备中（首帧之前）
+        if (!prepared && errorText == null) {
+            Box(
+                Modifier.fillMaxSize().background(Color(0xCC000000)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    CircularProgressIndicator(color = Color.White)
+                    Spacer(Modifier.height(14.dp))
+                    Text("正在准备播放流…", color = Color.White, fontSize = 15.sp)
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        if (slowPrepare) "该视频信息在文件尾部，需要先拉取末段" else "首次打开需要拉取索引与首段",
+                        color = Color.White.copy(alpha = 0.65f),
+                        fontSize = 12.sp,
+                    )
+                    if (slowPrepare) {
+                        Spacer(Modifier.height(10.dp))
+                        TextButton(onClick = { activity.finish() }) {
+                            Text("取消返回", color = Color.White)
+                        }
+                    }
+                }
             }
         }
 
-        // 错误覆盖层：文案 + 重试
+        // 缓冲中（已就绪后卡顿）
+        if (prepared && buffering && errorText == null) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                CircularProgressIndicator(color = Color.White, strokeWidth = 3.dp)
+            }
+        }
+
         errorText?.let { msg ->
             Box(
-                Modifier
-                    .fillMaxSize()
-                    .background(Color(0xCC000000)),
+                Modifier.fillMaxSize().background(Color(0xE6000000)),
                 contentAlignment = Alignment.Center,
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -592,14 +889,303 @@ private fun PlayerScreen(activity: PlayerActivity, player: ExoPlayer) {
                         modifier = Modifier.padding(horizontal = 32.dp),
                     )
                     Spacer(Modifier.height(16.dp))
-                    androidx.compose.material3.Button(onClick = { activity.retry() }) {
-                        Text("重试")
+                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        TextButton(onClick = { activity.retry() }) {
+                            Text("重试", color = Color.White)
+                        }
+                        TextButton(onClick = { activity.finish() }) {
+                            Text("返回", color = Color.White.copy(alpha = 0.7f))
+                        }
                     }
                 }
             }
         }
     }
 }
+
+/**
+ * 全屏切换：竖屏 -> 横屏全屏，横屏 -> 回竖屏。
+ * Manifest 锁定 portrait（始终竖屏），只有点「全屏」按钮才会临时横屏。
+ */
+private fun toggleFullscreen(activity: PlayerActivity) {
+    val landscape =
+        activity.resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+    activity.requestedOrientation = if (landscape) {
+        ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+    } else {
+        ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+    }
+}
+
+@Composable
+private fun TopBar(
+    title: String,
+    meta: String,
+    tag: String,
+    onBack: () -> Unit,
+    onLock: () -> Unit,
+    isFullscreen: Boolean,
+    onToggleFullscreen: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier
+            .fillMaxWidth()
+            .background(Color(0x99000000))
+            .statusBarsPadding()
+            .padding(horizontal = 4.dp, vertical = 2.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = onBack) {
+                Icon(
+                    Icons.AutoMirrored.Filled.ArrowBack,
+                    contentDescription = "返回",
+                    tint = Color.White,
+                )
+            }
+            Column(Modifier.weight(1f)) {
+                Text(
+                    title,
+                    color = Color.White,
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                val line = listOf(meta, tag).filter { it.isNotBlank() }.joinToString("  ")
+                if (line.isNotBlank()) {
+                    Text(
+                        line,
+                        color = Color.White.copy(alpha = 0.6f),
+                        fontSize = 11.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+            IconButton(onClick = onToggleFullscreen) {
+                Icon(
+                    if (isFullscreen) AppIcons.FullscreenExit else AppIcons.Fullscreen,
+                    contentDescription = if (isFullscreen) "退出全屏" else "全屏",
+                    tint = Color.White,
+                )
+            }
+            IconButton(onClick = onLock) {
+                LockIcon(locked = false, tint = Color.White)
+            }
+        }
+    }
+}
+
+/**
+ * 播放进度条（自绘）：同一条轨道内三层——已播放(主色) / 已缓存(白色半透明) / 未下载(灰)。
+ * 支持点按与拖动 seek。
+ */
+@Composable
+private fun PlayerSeekBar(
+    value: Float,
+    buffered: Float,
+    onSeek: (Float) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val primary = MaterialTheme.colorScheme.primary
+    var drag by remember { mutableStateOf<Float?>(null) }
+    val pos = drag ?: value
+    Box(
+        modifier
+            .height(30.dp)
+            .semantics { contentDescription = "播放进度${(pos * 100).toInt()}%，缓存${(buffered * 100).toInt()}%" }
+            .pointerInput(Unit) {
+                detectTapGestures { off ->
+                    onSeek((off.x / size.width.toFloat()).coerceIn(0f, 1f))
+                }
+            }
+            .pointerInput(Unit) {
+                detectDragGestures(
+                    onDragStart = { off -> drag = (off.x / size.width.toFloat()).coerceIn(0f, 1f) },
+                    onDrag = { change, _ ->
+                        change.consume()
+                        drag = (change.position.x / size.width.toFloat()).coerceIn(0f, 1f)
+                    },
+                    onDragEnd = {
+                        drag?.let { onSeek(it) }
+                        drag = null
+                    },
+                    onDragCancel = { drag = null },
+                )
+            },
+        contentAlignment = Alignment.Center,
+    ) {
+        Canvas(Modifier.fillMaxWidth().height(6.dp)) {
+            val radius = size.height / 2f
+            drawRoundRect(Color.White.copy(alpha = 0.22f), cornerRadius = CornerRadius(radius, radius))
+            val bw = size.width * buffered.coerceIn(0f, 1f)
+            if (bw > 0f) {
+                drawRoundRect(
+                    Color.White.copy(alpha = 0.45f),
+                    size = Size(bw, size.height),
+                    cornerRadius = CornerRadius(radius, radius),
+                )
+            }
+            val pw = size.width * pos.coerceIn(0f, 1f)
+            if (pw > 0f) {
+                drawRoundRect(
+                    primary,
+                    size = Size(pw, size.height),
+                    cornerRadius = CornerRadius(radius, radius),
+                )
+            }
+        }
+        Canvas(Modifier.fillMaxWidth().height(18.dp)) {
+            val r = 7.dp.toPx()
+            val cx = (size.width * pos.coerceIn(0f, 1f)).coerceIn(r, (size.width - r).coerceAtLeast(r))
+            drawCircle(primary, radius = r, center = Offset(cx, size.height / 2f))
+        }
+    }
+}
+
+@Composable
+private fun BottomBar(
+    activity: PlayerActivity,
+    playing: Boolean,
+    positionMs: Long,
+    durationMs: Long,
+    buffered: Float,
+    speed: Float,
+    fill: Int,
+    hasPrev: Boolean,
+    hasNext: Boolean,
+    queueLabel: String,
+    modifier: Modifier = Modifier,
+) {
+    var dragValue by remember { mutableStateOf<Float?>(null) }
+    var speedMenu by remember { mutableStateOf(false) }
+    val durF = durationMs.coerceAtLeast(1L).toFloat()
+
+    Column(
+        modifier
+            .fillMaxWidth()
+            .background(
+                Brush.verticalGradient(
+                    listOf(Color(0x000A0D12), Color(0xCC0A0D12), Color(0xF20A0D12))
+                )
+            )
+            .navigationBarsPadding()
+            .padding(horizontal = 14.dp, vertical = 8.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                formatDuration(positionMs),
+                color = Color.White,
+                fontSize = 12.sp,
+            )
+            PlayerSeekBar(
+                value = (positionMs.toFloat() / durF).coerceIn(0f, 1f),
+                buffered = buffered,
+                onSeek = { f -> activity.seekTo((f * durF).toLong()) },
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(horizontal = 8.dp),
+            )
+            Text(
+                formatDuration(durationMs),
+                color = Color.White.copy(alpha = 0.75f),
+                fontSize = 12.sp,
+            )
+        }
+
+        Row(
+            Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                IconButton(onClick = { activity.playPrev() }, enabled = hasPrev) {
+                    Icon(
+                        AppIcons.SkipPrevious,
+                        contentDescription = "上一集",
+                        tint = if (hasPrev) Color.White else Color.White.copy(alpha = 0.3f),
+                        modifier = Modifier.size(26.dp),
+                    )
+                }
+                Box(
+                    Modifier
+                        .padding(horizontal = 10.dp)
+                        .size(52.dp)
+                        .background(MaterialTheme.colorScheme.primary, androidx.compose.foundation.shape.CircleShape),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    IconButton(onClick = { activity.togglePlayPause() }) {
+                        Icon(
+                            if (playing) AppIcons.Pause else AppIcons.Play,
+                            contentDescription = if (playing) "暂停" else "播放",
+                            tint = Color.White,
+                            modifier = Modifier.size(30.dp),
+                        )
+                    }
+                }
+                IconButton(onClick = { activity.playNext() }, enabled = hasNext) {
+                    Icon(
+                        AppIcons.SkipNext,
+                        contentDescription = "下一集",
+                        tint = if (hasNext) Color.White else Color.White.copy(alpha = 0.3f),
+                        modifier = Modifier.size(26.dp),
+                    )
+                }
+                if (queueLabel.isNotBlank()) {
+                    Text(queueLabel, color = Color.White.copy(alpha = 0.5f), fontSize = 11.sp,
+                        modifier = Modifier.padding(start = 6.dp))
+                }
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                TextButton(onClick = { toggleFullscreen(activity) }) {
+                    Text(
+                        if (activity.resources.configuration.orientation ==
+                            Configuration.ORIENTATION_LANDSCAPE
+                        ) "退出全屏" else "全屏",
+                        color = Color.White,
+                        fontSize = 13.sp,
+                    )
+                }
+                Box {
+                    TextButton(onClick = { speedMenu = true }) {
+                        Text(
+                            if (abs(speed - 1f) < 0.01f) "倍速" else trimSpeedLabel(speed),
+                            color = Color.White,
+                            fontSize = 13.sp,
+                        )
+                    }
+                    DropdownMenu(expanded = speedMenu, onDismissRequest = { speedMenu = false }) {
+                        PlayerActivity.SPEEDS.forEach { v ->
+                            DropdownMenuItem(
+                                text = {
+                                    Text(
+                                        if (abs(v - 1f) < 0.01f) "1x 正常" else trimSpeedLabel(v),
+                                        fontWeight = if (abs(v - speed) < 0.01f) FontWeight.Bold else FontWeight.Normal,
+                                    )
+                                },
+                                onClick = {
+                                    activity.pickSpeed(v)
+                                    speedMenu = false
+                                },
+                            )
+                        }
+                    }
+                }
+                TextButton(onClick = { activity.cycleFill() }) {
+                    Text(
+                        PlayerActivity.FILL_LABELS[fill.coerceIn(0, 3)],
+                        color = Color.White,
+                        fontSize = 13.sp,
+                    )
+                }
+            }
+        }
+    }
+}
+
+private fun trimSpeedLabel(v: Float): String =
+    if (abs(v - v.toInt().toFloat()) < 0.01f) "${v.toInt()}x" else "${v}x"
 
 @Composable
 private fun CenterOverlay(text: String) {
@@ -622,14 +1208,12 @@ private fun LockIcon(locked: Boolean, tint: Color) {
     Canvas(Modifier.size(22.dp)) {
         val w = size.width
         val h = size.height
-        // 锁体
         drawRoundRect(
             color = tint,
             topLeft = Offset(w * 0.22f, h * 0.46f),
             size = Size(w * 0.56f, h * 0.40f),
             cornerRadius = CornerRadius(w * 0.08f),
         )
-        // 锁环（锁定 180°；解锁抬起 120°）
         drawArc(
             color = tint,
             startAngle = 180f,

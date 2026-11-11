@@ -58,8 +58,8 @@ fun OnboardingFlow(onFinished: () -> Unit) {
             .background(
                 Brush.verticalGradient(
                     listOf(
-                        Color(0xFF17212B),
-                        Color(0xFF0E1621),
+                        Color(0xFF0A0D12),
+                        Color(0xFF0E141B),
                     )
                 )
             )

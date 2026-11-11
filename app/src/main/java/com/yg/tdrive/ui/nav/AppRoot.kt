@@ -12,6 +12,8 @@ import androidx.compose.ui.Modifier
 import com.yg.tgdrive.ServiceLocator
 import com.yg.tgdrive.td.AuthState
 import com.yg.tgdrive.ui.onboarding.OnboardingFlow
+import com.yg.tgdrive.ui.download.DownloadScreen
+import com.yg.tgdrive.ui.search.SearchScreen
 import com.yg.tgdrive.ui.settings.SettingsScreen
 import com.yg.tgdrive.ui.wall.MainScreen
 import kotlinx.coroutines.flow.first
@@ -39,8 +41,12 @@ fun AppRoot() {
         Routes.SETTINGS -> SettingsScreen(
             onBack = { route = Routes.HOME },
         )
+        Routes.SEARCH -> SearchScreen(onBack = { route = Routes.HOME })
+        Routes.DOWNLOAD -> DownloadScreen(onBack = { route = Routes.HOME })
         else -> MainScreen(
             onOpenSettings = { route = Routes.SETTINGS },
+            onOpenSearch = { route = Routes.SEARCH },
+            onOpenDownload = { route = Routes.DOWNLOAD },
         )
     }
 }

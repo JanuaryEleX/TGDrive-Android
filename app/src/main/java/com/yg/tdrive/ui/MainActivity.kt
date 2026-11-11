@@ -4,7 +4,7 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import com.yg.tgdrive.ui.common.AppTheme
+import com.yg.tgdrive.ui.common.TgTheme
 import com.yg.tgdrive.ui.nav.AppRoot
 
 /**
@@ -16,7 +16,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
-            AppTheme {
+            TgTheme {
                 AppRoot()
             }
         }

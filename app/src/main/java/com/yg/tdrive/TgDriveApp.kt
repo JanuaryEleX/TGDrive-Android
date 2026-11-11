@@ -60,6 +60,10 @@ class TgDriveApp : Application() {
                     }
                 }.onFailure { Log.e("TgDriveApp", "retry apply proxy failed", it) }
             }
+
+            // TDLib 就绪后启动 v1→v2 相册 ID 回填（后台，不阻塞 UI）。
+            // 用 sl.context（Application）而非 launch 作用域的 this（CoroutineScope）。
+            sl.scheduleAlbumBackfill(sl.context)
         }
     }
 }

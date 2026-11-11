@@ -109,6 +109,13 @@ data class MediaEntity(
     /** epoch s */
     @ColumnInfo(name = "message_date")
     val messageDate: Long,
+    /**
+     * TG 相册 ID：同一次「发送相册」产生的多条 photo/video message 共享同一 id；
+     * 不属于相册时为 NULL（TDLib 里非相册消息 media_album_id=0，入库时归一化为 null）。
+     * 图片 tab 靠它判断「这张图所在的相册里有没有视频」。
+     */
+    @ColumnInfo(name = "media_album_id")
+    val mediaAlbumId: Long? = null,
     /** 本地缩略图缓存绝对路径，可 NULL */
     @ColumnInfo(name = "thumb_path")
     val thumbPath: String? = null,

@@ -303,6 +303,107 @@ class MediaRepository(
     /** 继续观看行（SPEC §4.5）：有进度未看完的 video，updated_at DESC，前 20。 */
     fun observeContinueWatching(): Flow<List<MediaItem>> = mediaDao.observeContinueWatching()
 
+    // ── 相册（media_album_id）──────────────────────────────────────────────
+
+    /**
+     * 批量取「哪些相册含视频 + 组内视频时长」。
+     * 图片 tab 一页图片的相册 id 去重后一次 IN 查询拿全，避免逐格 N+1。
+     */
+    suspend fun albumVideoInfo(albumIds: Collection<Long>): Map<Long, Long?> {
+        val ids = albumIds.filter { it > 0L }.distinct()
+        if (ids.isEmpty()) return emptyMap()
+        return withContext(Dispatchers.IO) {
+            mediaDao.albumVideoInfos(ids).associate { it.albumId to it.durationMs }
+        }
+    }
+
+    /** 看图页：同相册图片序列。 */
+    suspend fun imagesInAlbum(albumId: Long): List<MediaEntity> =
+        withContext(Dispatchers.IO) { mediaDao.imagesInAlbum(albumId) }
+
+    /** 看图页跳播：同相册视频序列。 */
+    suspend fun videosInAlbum(albumId: Long): List<MediaEntity> =
+        withContext(Dispatchers.IO) { mediaDao.videosInAlbum(albumId) }
+
+    /**
+     * 相册 ID 回填（v1 → v2 老数据）。
+     *
+     * 为什么必须单独回填：`insertAllIgnoring` 对已存在行返回 -1 且**不更新任何字段**，
+     * 所以重跑 fullScan 填不上老行的 media_album_id。唯一可靠路径是逐条 getMessage
+     * 取 `media_album_id` 再 UPDATE 回写。
+     *
+     * 分批 + 节流，避免触发 TG FLOOD_WAIT；进度经 [onProgress] 回调。
+     * 返回实际处理的行数。
+     */
+    suspend fun backfillAlbumIds(
+        onProgress: (done: Int, total: Int) -> Unit = { _, _ -> },
+    ): Int {
+        val total = withContext(Dispatchers.IO) { mediaDao.countMissingAlbum() }
+        if (total <= 0) return 0
+        val driveIds = withContext(Dispatchers.IO) { mediaDao.driveIdsMissingAlbum() }
+        Log.i(TAG, "相册回填开始: 缺 $total 行, 驱动器=$driveIds")
+        var done = 0
+        for (driveId in driveIds) {
+            val drive = driveDao.getById(driveId) ?: continue
+            val chatId = drive.chatId
+            var fromMessageId = 0L
+            var emptyRetries = 0
+            var shortRetries = 0
+            while (true) {
+                val resp = runCatching {
+                    callWithFloodRetry(
+                        tdObj(
+                            "@type" to "getChatHistory",
+                            "chat_id" to chatId,
+                            "from_message_id" to fromMessageId,
+                            "offset" to 0,
+                            "limit" to SCAN_PAGE_SIZE,
+                            "only_local" to false,
+                        )
+                    )
+                }.getOrNull() ?: break
+                val messages = resp["messages"]?.jsonArray
+                    ?.mapNotNull { it as? JsonObject } ?: emptyList()
+                if (messages.isEmpty()) {
+                    if (emptyRetries < EMPTY_PAGE_RETRIES) {
+                        emptyRetries++
+                        delay(EMPTY_PAGE_DELAY_MS)
+                        continue
+                    }
+                    break
+                }
+                emptyRetries = 0
+                // 用一条历史页批量回填本地缺相册的行：整页只发一次网络请求，
+                // 逐条走本地 UPDATE（比逐条 getMessage 快两个数量级）。
+                for (msg in messages) {
+                    val msgId = msg["id"]?.jsonPrimitive?.longOrNull ?: continue
+                    val albumId = msg["media_album_id"]?.jsonPrimitive?.longOrNull?.takeIf { it != 0L }
+                    val updated = withContext(Dispatchers.IO) {
+                        mediaDao.backfillAlbumId(chatId, msgId, albumId)
+                    }
+                    if (updated > 0) {
+                        done += updated
+                        onProgress(done, total)
+                    }
+                }
+                val lastId = messages.last()["id"]?.jsonPrimitive?.longOrNull ?: break
+                if (lastId == 0L) break
+                if (messages.size < SCAN_PAGE_SIZE) {
+                    shortRetries++
+                    if (shortRetries > SHORT_PAGE_RETRIES) break
+                    delay(SHORT_PAGE_DELAY_MS)
+                    continue
+                }
+                shortRetries = 0
+                fromMessageId = lastId
+                delay(PAGE_DELAY_MS)
+            }
+            Log.i(TAG, "相册回填: drive=$driveId 累计=$done")
+        }
+        Log.i(TAG, "相册回填完成: 处理=$done 总缺=$total")
+        return done
+    }
+
     /** FTS 搜索（SPEC §4.5）：display_name 挂 media_fts；空查询返回空列表。 */
     suspend fun search(q: String): List<MediaItem> {
         val query = q.trim()
@@ -314,6 +415,74 @@ class MediaRepository(
             .onFailure { Log.w(TAG, "search failed: $ftsQuery", it) }
             .getOrDefault(emptyList())
     }
+
+    /**
+     * 全局搜索（跨 video+image，按 display_name FTS）分页。
+     * kind 非空时只返回该类型；空查询返回空列表。
+     */
+    suspend fun searchAll(
+        query: String,
+        kind: String? = null,
+        limit: Int = 50,
+        offset: Int = 0,
+    ): List<MediaItem> = withContext(Dispatchers.IO) {
+        val q = query.trim()
+        if (q.isEmpty()) return@withContext emptyList()
+        val ftsQuery = q.split(Regex("\\s+"))
+            .joinToString(" ") { "\"${it.replace("\"", "")}\"*" }
+        runCatching { mediaDao.searchAll(ftsQuery, kind, limit, offset) }
+            .onFailure { Log.w(TAG, "searchAll failed: $ftsQuery", it) }
+            .getOrDefault(emptyList())
+    }
+
+    /**
+     * 条件筛选 + 排序 + 分页（全局）。dateFrom/dateTo 单位为 epoch 秒。
+     * sortBy ∈ name|date|size|duration。
+     */
+    suspend fun filtered(
+        kind: String? = null,
+        minSize: Long? = null,
+        maxSize: Long? = null,
+        minDurationMs: Long? = null,
+        maxDurationMs: Long? = null,
+        dateFrom: Long? = null,
+        dateTo: Long? = null,
+        sortBy: String = "date",
+        desc: Boolean = true,
+        limit: Int = 60,
+        offset: Int = 0,
+    ): List<MediaItem> = withContext(Dispatchers.IO) {
+        runCatching {
+            mediaDao.filtered(
+                kind, minSize, maxSize, minDurationMs, maxDurationMs,
+                dateFrom, dateTo, sortBy, desc, limit, offset,
+            )
+        }.onFailure { Log.w(TAG, "filtered failed", it) }
+            .getOrDefault(emptyList())
+    }
+
+    /** 海报墙/图片网格「筛选 + 排序」分页流（限定 driveId + kind）。 */
+    fun observeFilteredWall(
+        driveId: Long,
+        kind: String,
+        minSize: Long? = null,
+        maxSize: Long? = null,
+        minDurationMs: Long? = null,
+        maxDurationMs: Long? = null,
+        dateFrom: Long? = null,
+        dateTo: Long? = null,
+        sortBy: String = "date",
+        desc: Boolean = true,
+    ): Flow<PagingData<MediaItem>> =
+        Pager(
+            config = PagingConfig(pageSize = 60, prefetchDistance = 30, enablePlaceholders = false),
+            pagingSourceFactory = {
+                mediaDao.observeFilteredPaged(
+                    driveId, kind, minSize, maxSize, minDurationMs, maxDurationMs,
+                    dateFrom, dateTo, sortBy, desc,
+                )
+            },
+        ).flow
 
     // ═══════════════════════ 管理 ═══════════════════════
 
@@ -563,6 +732,8 @@ class MediaRepository(
             width = width,
             height = height,
             messageDate = messageDate,
+            // TDLib：非相册消息 media_album_id=0，归一化为 null；同相册多条消息共享同一 id
+            mediaAlbumId = msg["media_album_id"]?.jsonPrimitive?.longOrNull?.takeIf { it != 0L },
             thumbPath = null,
             stale = false,
         )
@@ -659,6 +830,8 @@ class MediaRepository(
 
     companion object {
         private const val TAG = "MediaRepository"
+
+
         private const val SCAN_PAGE_SIZE = 100
         private const val PAGE_DELAY_MS = 150L
         private const val THUMB_PRIORITY = 2

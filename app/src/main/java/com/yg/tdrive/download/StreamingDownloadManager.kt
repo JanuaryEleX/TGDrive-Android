@@ -71,8 +71,8 @@ class StreamingDownloadManager(
         /** 窗口前伸下限：max(4MB, len*2)（SPEC §4.3）。 */
         private const val WINDOW_MIN_AHEAD = 4L * 1024 * 1024
 
-        /** 流播下载优先级（缩略图 priority=2 后台拉取；正片 priority=1 更优先）。 */
-        private const val PRIORITY_STREAM = 1
+        /** 流播下载优先级：TDLib priority 1=最低、32=最高。正片给最高 32，压过缩略图(2)/离线(16)。 */
+        private const val PRIORITY_STREAM = 32
 
         /** chunk 尝试次数：1 次首发 + 2 次重试（1s/3s，SPEC §4.3）。 */
         private const val CHUNK_ATTEMPTS = 3
@@ -153,6 +153,9 @@ class StreamingDownloadManager(
         /** 窗口已请求到的终点（绝对偏移）。 */
         @Volatile var requestedEnd = 0L
 
+        /** 已为哪个窗口基址发过"连续下到文件尾(limit=0)"请求；避免每次读都重发请求造成抖动掉速。 */
+        @Volatile var streamBase = Long.MIN_VALUE
+
         /** 相对 [base] 的连续可读前缀字节数（可读唯一判据，窗口内单调不减）。 */
         val readable = MutableStateFlow(0L)
 
@@ -189,6 +192,9 @@ class StreamingDownloadManager(
 
         /** getFile 快照是否已做过一次（防重复快照）。 */
         @Volatile var snapshotted = false
+
+        /** 上层已放弃本会话（cancelAll 硬取消）：updateFile/applyFileState 不再复活。 */
+        @Volatile var abandoned = false
     }
 
     // ═══════════════════════ 生命周期 ═══════════════════════
@@ -257,7 +263,7 @@ class StreamingDownloadManager(
             // 尾部窗口（moov 在文件尾）只走 synchronous 精确拉取，不再铺异步分片：
             // 两者并存会互相取消 → "td error 200: Canceled by another downloadFile request"，
             // 该异常一路上抛成 ExoPlayer 的 Loader$UnexpectedLoaderException。
-            if (aligned <= 0L) {
+            if (!nearTail) {
                 scheduleWindowChunksLocked(s, aligned, max(WINDOW_MIN_AHEAD, need * 2))
             }
         }
@@ -314,9 +320,33 @@ class StreamingDownloadManager(
         }
     }
 
-    /** 取消全部会话的在飞分片（播放页 onDestroy 调用）。 */
+    /**
+     * 硬取消全部会话（播放页 onStop/onDestroy 调用）。
+     *
+     * 与窗口平移的 [cancelPending]（only_pending=true，只停排队分片、保已落盘）不同，
+     * 退出播放后必须真正停掉 TDLib 端"当前在飞"的 downloadFile —— 那类请求常常是
+     * limit=0（连续下到文件尾），only_pending=true 拦不住它，表现为退出后仍默默下完整个文件。
+     * 这里用 only_pending=false 硬取消，并把会话标记 abandoned，防止迟到的 updateFile
+     * 把会话救活、再次拉起下载。
+     */
     fun cancelAll() {
-        sessions.keys.toList().forEach { cancelPending(it) }
+        sessions.keys.toList().forEach { fileId ->
+            val s = sessions[fileId] ?: return@forEach
+            s.abandoned = true
+            val jobs = s.chunks.values.toList()
+            s.chunks.clear()
+            jobs.forEach { it.canceled = true; it.job?.cancel() }
+            scope.launch {
+                runCatching {
+                    tdLong(tdObj(
+                        "@type" to "cancelDownloadFile",
+                        "file_id" to fileId,
+                        "only_pending" to false,
+                    ))
+                }.onFailure { Log.w(TAG, "cancelDownloadFile(hard) $fileId failed: ${it.message}") }
+            }
+        }
+        sessions.clear()
     }
 
     /** 清空 LRU 缓存目录（设置页「清空缓存」钩子；MediaRepository.clearCacheHook 委托目标）。 */
@@ -326,6 +356,22 @@ class StreamingDownloadManager(
         lruDir.deleteRecursively()
         lruDir.mkdirs()
         Unit
+    }
+
+    /**
+     * 若该文件已被 TDLib 完整下载（local.is_downloading_completed=true），返回其本地完整文件，
+     * 供播放层直连（零 TDLib 下载、跳过 faststart 重排）。未完成返回 null。
+     *
+     * 完整文件本地随机读时，moov 即便在文件尾也能按绝对偏移正确 seek，不存在流式
+     * DataSource 的"load 起点当作原点"二次叠加问题，因此完整文件无需 FaststartRemuxer。
+     */
+    suspend fun completedLocalFile(fileId: Int): File? {
+        val s = session(fileId)
+        ensureSnapshot(s)
+        if (!s.completed.value) return null
+        val path = s.partialPath.value ?: return null
+        val f = File(path)
+        return if (f.isFile && f.length() > 0L) f else null
     }
 
     /** LRU 命中查询：完整缓存文件存在则返回（并刷新访问序），否则 null。 */
@@ -343,6 +389,25 @@ class StreamingDownloadManager(
     fun setConcurrency(n: Int) {
         gate.resize(n.coerceIn(1, MAX_CONCURRENCY))
     }
+
+    /**
+     * 供播放页画「缓存进度」：返回当前文件"连续可读到"的绝对偏移（= 窗口基址 + 窗口内可读前缀）。
+     * 比 downloaded_size（全文件任意位置累计）更贴近真实可播放范围：从头播放即 0..N 连续前缀，
+     * 中段/续播即 base..base+readable。整文件完成 = 总大小。
+     */
+    fun bufferedBytes(fileId: Int): Long {
+        val s = sessions[fileId] ?: return 0L
+        if (s.completed.value) return s.expectedSize.takeIf { it > 0L } ?: Long.MAX_VALUE
+        val originBase = if (s.base > 0L) s.base else 0L
+        val frontier = originBase + s.readable.value
+        val total = s.expectedSize
+        var end = maxOf(s.downloadedSize, frontier)
+        if (total > 0L) end = end.coerceAtMost(total)
+        return end
+    }
+
+    /** 当前文件总字节（未知 = 0）。 */
+    fun totalBytes(fileId: Int): Long = sessions[fileId]?.expectedSize ?: 0L
 
     /** LRU 缓存上限（GB），可选接口；后续接 settings.cacheCapGb（本轮常量 4GB）。 */
     fun setCacheCapGb(gb: Long) {
@@ -400,16 +465,37 @@ class StreamingDownloadManager(
      */
     private fun scheduleWindowChunksLocked(s: FileSession, aligned: Long, windowAhead: Long) {
         val targetEnd = aligned + windowAhead
-        // limit=0 的请求会从 aligned 连续下到文件末尾，单路即可覆盖整个窗口。
-        // 旧实现按 1MB 发 4 路带 limit 的请求，TDLib 每路只下 1MB 且互相抢占，
-        // 结果中段长期是空洞（实测播放报 Invalid NAL length 的根因）。
-        var issued = false
-        if (!s.chunks.containsKey(aligned)) {
-            launchChunk(s, aligned)
-            issued = true
+        // 单路连续下载：downloadFile(offset=aligned, limit=0) 让 TDLib 从 aligned 一直下到
+        // 文件末尾，只发一次、不逐段重发（重发会让 TDLib 反复重定向游标，实测明显掉速）。
+        // 头部(0) 与中段 seek 都走这条；尾部(moov) 由 synchronous 精确拉取单独处理。
+        if (s.streamBase != aligned) {
+            s.streamBase = aligned
+            s.failure = null
+            launchContinuous(s, aligned)
         }
         s.requestedEnd = max(s.requestedEnd, targetEnd)
-        if (issued) s.failure = null   // 有新 chunk 补发 → 清除粘滞失败，重新给机会
+    }
+
+    /**
+     * 发一条 limit=0 的连续下载，不阻塞等待：TDLib 在后台按自身游标顺序落盘，
+     * 进度由 updateFile（可读前缀/已下载字节）驱动。失败则清空 streamBase 允许下次重发。
+     */
+    private fun launchContinuous(s: FileSession, offset: Long) {
+        scope.launch {
+            try {
+                val resp = tdLong(tdObj(
+                    "@type" to "downloadFile",
+                    "file_id" to s.fileId,
+                    "offset" to offset,
+                    "limit" to 0,
+                    "priority" to PRIORITY_STREAM,
+                ))
+                applyFileState(s, resp, establishBaseline = (offset == s.base))
+            } catch (t: Throwable) {
+                if (s.streamBase == offset) s.streamBase = Long.MIN_VALUE
+                Log.w(TAG, "连续下载 file ${s.fileId}@$offset 失败，稍后可重发: ${t.message}")
+            }
+        }
     }
 
     private fun launchChunk(s: FileSession, chunkOffset: Long) {
@@ -637,6 +723,7 @@ class StreamingDownloadManager(
      * downloaded_prefix_size 相对值才可信（任务书事实 2）。
      */
     private fun applyFileState(s: FileSession, file: JsonObject, establishBaseline: Boolean) {
+        if (s.abandoned) return   // 已硬取消，迟到的 file 推送一律忽略，防止复活下载
         val local = file["local"] as? JsonObject ?: return
 
         (local["downloaded_size"] as? JsonPrimitive)?.longOrNull

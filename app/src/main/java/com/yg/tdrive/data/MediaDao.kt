@@ -67,6 +67,106 @@ interface MediaDao {
     )
     suspend fun search(query: String): List<MediaEntity>
 
+    /**
+     * 全局搜索：跨 video+image 按 display_name 匹配（复用 media_fts MATCH）。
+     * kind 非空时按 kind 过滤；按 message_date DESC 分页。
+     */
+    @Query(
+        """
+        SELECT media.* FROM media
+        JOIN media_fts ON media_fts.rowid = media.id
+        WHERE media_fts MATCH :query
+          AND (:kind IS NULL OR media.kind = :kind)
+        ORDER BY media.message_date DESC
+        LIMIT :limit OFFSET :offset
+        """
+    )
+    suspend fun searchAll(
+        query: String,
+        kind: String?,
+        limit: Int,
+        offset: Int,
+    ): List<MediaEntity>
+
+    /**
+     * 条件筛选 + 排序 + 分页（全局，跨驱动器）。
+     * sortBy ∈ {name,date,size,duration}；desc=true 降序。
+     * 动态排序用 CASE 表达式实现（Room 不允许直接拼接 ORDER BY 片段）。
+     */
+    @Query(
+        """
+        SELECT * FROM media
+        WHERE (:kind IS NULL OR kind = :kind)
+          AND (:minSize IS NULL OR size >= :minSize)
+          AND (:maxSize IS NULL OR size <= :maxSize)
+          AND (:minDurationMs IS NULL OR duration_ms >= :minDurationMs)
+          AND (:maxDurationMs IS NULL OR duration_ms <= :maxDurationMs)
+          AND (:dateFrom IS NULL OR message_date >= :dateFrom)
+          AND (:dateTo IS NULL OR message_date <= :dateTo)
+        ORDER BY
+          CASE WHEN :sortBy = 'name'     AND :desc = 0 THEN display_name END ASC,
+          CASE WHEN :sortBy = 'name'     AND :desc = 1 THEN display_name END DESC,
+          CASE WHEN :sortBy = 'date'     AND :desc = 0 THEN message_date END ASC,
+          CASE WHEN :sortBy = 'date'     AND :desc = 1 THEN message_date END DESC,
+          CASE WHEN :sortBy = 'size'     AND :desc = 0 THEN size END ASC,
+          CASE WHEN :sortBy = 'size'     AND :desc = 1 THEN size END DESC,
+          CASE WHEN :sortBy = 'duration' AND :desc = 0 THEN duration_ms END ASC,
+          CASE WHEN :sortBy = 'duration' AND :desc = 1 THEN duration_ms END DESC
+        LIMIT :limit OFFSET :offset
+        """
+    )
+    suspend fun filtered(
+        kind: String?,
+        minSize: Long?,
+        maxSize: Long?,
+        minDurationMs: Long?,
+        maxDurationMs: Long?,
+        dateFrom: Long?,
+        dateTo: Long?,
+        sortBy: String,
+        desc: Boolean,
+        limit: Int,
+        offset: Int,
+    ): List<MediaEntity>
+
+    /**
+     * 海报墙/图片网格的「筛选 + 排序」分页数据源（Paging3，按驱动器 + kind 限定）。
+     * 与 observeWallPaged 并列；默认排序等价于 message_date DESC。
+     */
+    @Query(
+        """
+        SELECT * FROM media
+        WHERE drive_id = :driveId AND kind = :kind
+          AND (:minSize IS NULL OR size >= :minSize)
+          AND (:maxSize IS NULL OR size <= :maxSize)
+          AND (:minDurationMs IS NULL OR duration_ms >= :minDurationMs)
+          AND (:maxDurationMs IS NULL OR duration_ms <= :maxDurationMs)
+          AND (:dateFrom IS NULL OR message_date >= :dateFrom)
+          AND (:dateTo IS NULL OR message_date <= :dateTo)
+        ORDER BY
+          CASE WHEN :sortBy = 'name'     AND :desc = 0 THEN display_name END ASC,
+          CASE WHEN :sortBy = 'name'     AND :desc = 1 THEN display_name END DESC,
+          CASE WHEN :sortBy = 'date'     AND :desc = 0 THEN message_date END ASC,
+          CASE WHEN :sortBy = 'date'     AND :desc = 1 THEN message_date END DESC,
+          CASE WHEN :sortBy = 'size'     AND :desc = 0 THEN size END ASC,
+          CASE WHEN :sortBy = 'size'     AND :desc = 1 THEN size END DESC,
+          CASE WHEN :sortBy = 'duration' AND :desc = 0 THEN duration_ms END ASC,
+          CASE WHEN :sortBy = 'duration' AND :desc = 1 THEN duration_ms END DESC
+        """
+    )
+    fun observeFilteredPaged(
+        driveId: Long,
+        kind: String,
+        minSize: Long?,
+        maxSize: Long?,
+        minDurationMs: Long?,
+        maxDurationMs: Long?,
+        dateFrom: Long?,
+        dateTo: Long?,
+        sortBy: String,
+        desc: Boolean,
+    ): PagingSource<Int, MediaEntity>
+
     @Query(
         """
         DELETE FROM media
@@ -117,4 +217,69 @@ interface MediaDao {
     /** 清空某驱动器内缺封面行的 thumb_path，让下一轮扫描重新补抓。 */
     @Query("UPDATE media SET thumb_path = NULL WHERE drive_id = :driveId AND thumb_path IS NULL")
     suspend fun noopClearMissingThumb(driveId: Long)
+
+    // ── 相册（media_album_id）相关 ─────────────────────────────────────────
+
+    /**
+     * 批量判断「哪些相册里含视频」，并顺带取组内视频时长（取最短的那个视频作为角标时长）。
+     * 图片 tab 渲染时一次 IN 查询拿全，避免每格 N+1。
+     */
+    @Query(
+        """
+        SELECT media_album_id AS albumId, MIN(duration_ms) AS durationMs
+        FROM media
+        WHERE media_album_id IN (:albumIds) AND kind = 'video'
+        GROUP BY media_album_id
+        """
+    )
+    suspend fun albumVideoInfos(albumIds: List<Long>): List<AlbumVideoInfo>
+
+    /** 看图页：同相册的图片，按消息 id 升序（相册内原始顺序）。 */
+    @Query(
+        """SELECT * FROM media WHERE media_album_id = :albumId AND kind = 'image'
+           ORDER BY message_id ASC"""
+    )
+    suspend fun imagesInAlbum(albumId: Long): List<MediaEntity>
+
+    /** 相册内的视频（供「播放视频」跳转/多视频列表）。 */
+    @Query(
+        """SELECT * FROM media WHERE media_album_id = :albumId AND kind = 'video'
+           ORDER BY message_id ASC"""
+    )
+    suspend fun videosInAlbum(albumId: Long): List<MediaEntity>
+
+    /** 回填：待补相册 ID 的行（media_album_id IS NULL 且未失效）。 */
+    @Query(
+        """SELECT * FROM media WHERE media_album_id IS NULL AND stale = 0 AND drive_id = :driveId
+           ORDER BY id ASC LIMIT :limit"""
+    )
+    suspend fun rowsMissingAlbum(driveId: Long, limit: Int): List<MediaEntity>
+
+    /** 回填：全库还有多少行缺相册 ID。 */
+    @Query("SELECT COUNT(*) FROM media WHERE media_album_id IS NULL")
+    suspend fun countMissingAlbum(): Int
+
+    /** 回填：还有缺相册 ID 行的驱动器列表。 */
+    @Query("SELECT DISTINCT drive_id FROM media WHERE media_album_id IS NULL")
+    suspend fun driveIdsMissingAlbum(): List<Long>
+
+    /** 回填：写入某行的相册 ID（按主键）。 */
+    @Query("UPDATE media SET media_album_id = :albumId WHERE id = :id")
+    suspend fun updateAlbumId(id: Long, albumId: Long?)
+
+    /**
+     * 回填：按 (chat_id, message_id) 写相册 ID，且只在尚未回填时生效。
+     * 返回受影响行数（0 = 库里没这条 / 已回填过）。
+     */
+    @Query(
+        """UPDATE media SET media_album_id = :albumId
+           WHERE chat_id = :chatId AND message_id = :messageId AND media_album_id IS NULL"""
+    )
+    suspend fun backfillAlbumId(chatId: Long, messageId: Long, albumId: Long?): Int
 }
+
+/** 相册 → 组内视频时长（角标用）。 */
+data class AlbumVideoInfo(
+    val albumId: Long,
+    val durationMs: Long?,
+)

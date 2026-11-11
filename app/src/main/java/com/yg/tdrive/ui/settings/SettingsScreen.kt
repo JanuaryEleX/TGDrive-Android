@@ -93,6 +93,9 @@ fun SettingsScreen(onBack: () -> Unit) {
             modifier = Modifier.padding(horizontal = 16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
+            // ---------- 主题 ----------
+            ThemeSection()
+
             DriveSection()
 
             // ---------- 并发滑杆 ----------
@@ -104,15 +107,18 @@ fun SettingsScreen(onBack: () -> Unit) {
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                    Spacer(Modifier.height(8.dp))
                     Slider(
                         value = concurrencyDraft,
                         onValueChange = { concurrencyDraft = it },
                         valueRange = 1f..8f,
                         steps = 6,
                     )
+                    Spacer(Modifier.height(8.dp))
                     Button(
                         onClick = { scope.launch { ServiceLocator.settings.setConcurrency(concurrencyDraft.toInt()) } },
                         enabled = concurrencyDraft.toInt() != concurrency,
+                        modifier = Modifier.fillMaxWidth(),
                     ) { Text("应用并发设置") }
                 }
             }
@@ -126,21 +132,32 @@ fun SettingsScreen(onBack: () -> Unit) {
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                    Spacer(Modifier.height(8.dp))
                     Slider(
                         value = cacheDraft,
                         onValueChange = { cacheDraft = it },
                         valueRange = 1f..64f,
                         steps = 62,
                     )
-                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Spacer(Modifier.height(8.dp))
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
                         Button(
                             onClick = { scope.launch { ServiceLocator.settings.setCacheCapGb(cacheDraft.toInt()) } },
                             enabled = cacheDraft.toInt() != cacheCapGb,
+                            modifier = Modifier.weight(1f),
                         ) { Text("应用缓存设置") }
-                        OutlinedButton(onClick = { showClearCacheConfirm = true }) { Text("清空缓存") }
+                        OutlinedButton(
+                            onClick = { showClearCacheConfirm = true },
+                            modifier = Modifier.weight(1f),
+                        ) { Text("清空缓存") }
                     }
                 }
             }
+
+            DownloadStoreSection()
 
             // ---------- 代理 ----------
             Card(Modifier.fillMaxWidth()) {
@@ -159,15 +176,26 @@ fun SettingsScreen(onBack: () -> Unit) {
             // ---------- API 凭据 ----------
             CredentialsSection()
 
-            // ---------- 退出登录 ----------
-            OutlinedButton(
-                onClick = { showLogoutConfirm = true },
-                modifier = Modifier.fillMaxWidth(),
-            ) { Text("退出登录", color = MaterialTheme.colorScheme.error) }
-
-            // ---------- 关于 ----------
-            OutlinedButton(onClick = { showAbout = true }, modifier = Modifier.fillMaxWidth()) {
-                Text("关于")
+            // ---------- 其它（与上面卡片同构） ----------
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp)) {
+                    Text("其它", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        "会话与关于",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedButton(
+                        onClick = { showLogoutConfirm = true },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text("退出登录", color = MaterialTheme.colorScheme.error) }
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedButton(
+                        onClick = { showAbout = true },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text("关于") }
+                }
             }
             Spacer(Modifier.height(24.dp))
         }
@@ -427,7 +455,7 @@ private fun CredentialsSection() {
                     Spacer(Modifier.height(4.dp))
                 }
 
-                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(
                         onClick = {
                             val id = idText.trim().toIntOrNull()
@@ -446,6 +474,7 @@ private fun CredentialsSection() {
                             }
                         },
                         enabled = canSave,
+                        modifier = Modifier.weight(1f),
                     ) { Text("保存") }
                     OutlinedButton(
                         onClick = {
@@ -459,9 +488,75 @@ private fun CredentialsSection() {
                             }
                         },
                         enabled = loaded && custom != null,
+                        modifier = Modifier.weight(1f),
                     ) { Text("恢复内置") }
                 }
             }
         }
     }
+}
+
+
+
+// ---------------- 下载存储位置 ----------------
+
+@Composable
+private fun DownloadStoreSection() {
+    val scope = rememberCoroutineScope()
+    val mode by ServiceLocator.settings.downloadStoreMode.collectAsState(initial = "private")
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp)) {
+            Text("下载存储位置", style = MaterialTheme.typography.titleMedium)
+            Text(
+                "私有：存到应用专属目录，仅本应用可见；公共：写入系统下载目录，文件管理器可见（Android 10+ 走 MediaStore）。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                ThemeChoice("私有", mode == "private", Modifier.weight(1f)) {
+                    scope.launch { ServiceLocator.settings.setDownloadStoreMode("private") }
+                }
+                ThemeChoice("公共", mode == "public", Modifier.weight(1f)) {
+                    scope.launch { ServiceLocator.settings.setDownloadStoreMode("public") }
+                }
+            }
+        }
+    }
+}
+
+// ---------------- 主题选择 ----------------
+
+@Composable
+private fun ThemeSection() {
+    val scope = rememberCoroutineScope()
+    val mode by ServiceLocator.settings.themeMode.collectAsState(initial = "system")
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp)) {
+            Text("主题", style = MaterialTheme.typography.titleMedium)
+            Text(
+                "跟随系统，或手动锁定深色 / 浅色。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                ThemeChoice("跟随系统", mode == "system", Modifier.weight(1f)) {
+                    scope.launch { ServiceLocator.settings.setThemeMode("system") }
+                }
+                ThemeChoice("浅色", mode == "light", Modifier.weight(1f)) {
+                    scope.launch { ServiceLocator.settings.setThemeMode("light") }
+                }
+                ThemeChoice("深色", mode == "dark", Modifier.weight(1f)) {
+                    scope.launch { ServiceLocator.settings.setThemeMode("dark") }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ThemeChoice(label: String, selected: Boolean, modifier: Modifier = Modifier, onClick: () -> Unit) {
+    if (selected) Button(onClick = onClick, modifier = modifier) { Text(label) }
+    else OutlinedButton(onClick = onClick, modifier = modifier) { Text(label) }
 }

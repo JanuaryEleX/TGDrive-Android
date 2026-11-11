@@ -10,5 +10,7 @@ package com.yg.tgdrive.ui.nav
 object Routes {
     const val HOME = "home"
     const val SETTINGS = "settings"
+    const val SEARCH = "search"
+    const val DOWNLOAD = "download"
     const val ONBOARDING = "onboarding"
 }

@@ -2,11 +2,13 @@ package com.yg.tgdrive
 
 import android.app.Application
 import android.content.Context
+import android.util.Log
 import androidx.room.Room
 import com.yg.tgdrive.data.AppDatabase
 import com.yg.tgdrive.data.DriveManager
 import com.yg.tgdrive.data.MediaRepository
 import com.yg.tgdrive.data.PlaybackProgressDao
+import com.yg.tgdrive.download.OfflineDownloadManager
 import com.yg.tgdrive.download.StreamingDownloadManager
 import com.yg.tgdrive.settings.CredentialsStore
 import com.yg.tgdrive.settings.SettingsStore
@@ -15,6 +17,7 @@ import com.yg.tgdrive.td.TdProxyManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 
 /**
@@ -63,6 +66,9 @@ object ServiceLocator {
     /** 全应用共享协程域（M4 上传通知条、扫描调度等长生命周期任务用它）。 */
     val appScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
+    /** 下载进行中/待查看徽标数（Wave1-B 离线下载器更新；>0 时顶栏下载图标显示红点）。 */
+    val downloadBadge = MutableStateFlow(0)
+
     // ---- TD 层 ----
     lateinit var tdClient: TdClient
         private set
@@ -87,6 +93,10 @@ object ServiceLocator {
 
     // ---- 下载层 ----
     lateinit var downloadManager: StreamingDownloadManager
+        private set
+
+    /** 离线下载管理器（Wave1-B：整文件永久保存）。 */
+    lateinit var offlineDownloads: OfflineDownloadManager
         private set
 
     private const val DB_NAME = "tgdrive.db"
@@ -117,7 +127,9 @@ object ServiceLocator {
             credentials = CredentialsStore(app)
             proxyManager = TdProxyManager(tdClient)
 
-            appDatabase = Room.databaseBuilder(app, AppDatabase::class.java, DB_NAME).build()
+            appDatabase = Room.databaseBuilder(app, AppDatabase::class.java, DB_NAME)
+                .addMigrations(AppDatabase.MIGRATION_1_2, AppDatabase.MIGRATION_2_3)
+                .build()
             // 三参构造：appContext 供缩略图落盘（cacheDir/thumbs）与 clearCache 使用
             mediaRepository = MediaRepository(appDatabase, tdClient, app)
             driveManager = DriveManager(appDatabase, tdClient)
@@ -137,9 +149,42 @@ object ServiceLocator {
                 appScope.launch { mediaRepository.fullScan(driveId) }
             }
 
+            // 离线下载管理：整文件永久保存 + 断点续传（appScope 承载长任务）
+            offlineDownloads = OfflineDownloadManager(
+                context = app,
+                td = tdClient,
+                dao = appDatabase.downloadTaskDao(),
+                settings = settings,
+                scope = appScope,
+                badge = downloadBadge,
+            )
+            // App 重启后续传：回落「下载中」→「排队」并等 TDLib 就绪后重新调度
+            offlineDownloads.reload()
+
             initialized = true
         }
     }
+
+    /**
+     * 相册 ID 回填（v1→v2）。由 TgDriveApp 在 TDLib 就绪（authState Ready）后调用，
+     * 因为回填要 getChatHistory，未就绪/未应用代理时取不到历史。
+     * 仅跑一次（maintenance 持久标记）；失败不标记，下次启动自动重试。
+     */
+    fun scheduleAlbumBackfill(app: Context) {
+        val prefs = app.getSharedPreferences("maintenance", Context.MODE_PRIVATE)
+        if (prefs.getBoolean(KEY_ALBUM_BACKFILL_DONE, false)) return
+        appScope.launch {
+            val n = runCatching { mediaRepository.backfillAlbumIds() }.getOrNull()
+            if (n != null) {
+                prefs.edit().putBoolean(KEY_ALBUM_BACKFILL_DONE, true).apply()
+                Log.i("ServiceLocator", "相册ID回填完成: $n 行")
+            } else {
+                Log.w("ServiceLocator", "相册ID回填失败（下次启动重试）")
+            }
+        }
+    }
+
+    private const val KEY_ALBUM_BACKFILL_DONE = "album_backfill_done_v2"
 
     /** 便捷判空（UI 冷启动竞态防御用，正常流程不需要）。 */
     val isInitialized: Boolean get() = initialized
