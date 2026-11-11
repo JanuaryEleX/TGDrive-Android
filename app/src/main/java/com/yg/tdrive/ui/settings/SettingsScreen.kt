@@ -43,6 +43,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import com.yg.tgdrive.BuildConfig
+import com.yg.tgdrive.CrashLogger
 import com.yg.tgdrive.ServiceLocator
 import com.yg.tgdrive.data.ScanDiagnostics
 import com.yg.tgdrive.ui.common.DriveEntity
@@ -77,6 +79,13 @@ fun SettingsScreen(onBack: () -> Unit) {
     // 【临时诊断】重扫取证入口的状态（定位视频丢因后整块删除）
     var diagRunning by remember { mutableStateOf(false) }
     var diagState by remember { mutableStateOf<String?>(null) }
+    // 本地崩溃日志条数：每次打开「关于」时重读（期间可能又有新崩溃）
+    var crashCount by remember { mutableStateOf(0) }
+    LaunchedEffect(showAbout) {
+        if (showAbout) {
+            crashCount = withContext(Dispatchers.IO) { CrashLogger.count(context) }
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -285,12 +294,35 @@ fun SettingsScreen(onBack: () -> Unit) {
             onDismissRequest = { showAbout = false },
             title = { Text("关于 TG云盘") },
             text = {
-                Text(
-                    "TG云盘 v0.2.0\n\n" +
-                        "用 Telegram 专用小号的私有频道当作私人网盘，" +
-                        "TDLib 直连 MTProto 流播视频与图片，全程无自建服务端。\n\n" +
-                        "免责：TG 云端无 SLA，请为重要内容保留独立备份；本应用仅供个人自用。",
-                )
+                Column {
+                    Text(
+                        "TG云盘 v${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})\n\n" +
+                            "用 Telegram 专用小号的私有频道当作私人网盘，" +
+                            "TDLib 直连 MTProto 流播视频与图片，全程无自建服务端。\n\n" +
+                            "免责：TG 云端无 SLA，请为重要内容保留独立备份；本应用仅供个人自用。",
+                    )
+                    // 只有存在崩溃日志时才显示（无崩溃 = 不打扰）
+                    if (crashCount > 0) {
+                        Spacer(Modifier.height(12.dp))
+                        HorizontalDivider()
+                        Spacer(Modifier.height(8.dp))
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                "崩溃日志：$crashCount 条",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.weight(1f),
+                            )
+                            TextButton(onClick = {
+                                scope.launch {
+                                    crashCount = withContext(Dispatchers.IO) {
+                                        CrashLogger.clear(context)
+                                    }
+                                }
+                            }) { Text("清空") }
+                        }
+                    }
+                }
             },
             confirmButton = { TextButton(onClick = { showAbout = false }) { Text("知道了") } },
         )
