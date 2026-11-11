@@ -60,6 +60,7 @@ import androidx.paging.compose.LazyPagingItems
 import androidx.paging.compose.collectAsLazyPagingItems
 import androidx.paging.compose.itemKey
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
 import com.yg.tgdrive.ServiceLocator
 import com.yg.tgdrive.td.AuthState
 import com.yg.tgdrive.ui.common.AppIcons
@@ -403,7 +404,11 @@ private fun ContinueCard(m: MediaEntity, onClick: () -> Unit) {
                 .background(MaterialTheme.colorScheme.surfaceVariant),
         ) {
             AsyncImage(
-                model = m.thumbPath?.let { java.io.File(it) },
+                model = ImageRequest.Builder(LocalContext.current)
+                    .data(m.thumbPath?.let { java.io.File(it) })
+                    .size(CONTINUE_DECODE_PX)
+                    .crossfade(false)
+                    .build(),
                 contentDescription = m.displayName,
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.fillMaxSize(),
@@ -420,6 +425,16 @@ private fun ContinueCard(m: MediaEntity, onClick: () -> Unit) {
         )
     }
 }
+
+/**
+ * 海报解码尺寸（像素）。
+ * 三列布局、卡片约 120dp 宽 → 按最高 3x 密度算 360px，取 400 留余量。
+ * 固定像素值让 Coil 的内存缓存键稳定，避免同图不同尺寸重复解码。
+ */
+private val POSTER_DECODE_PX = 400
+
+/** 继续观看卡片：176dp 宽 16:9 → 3x 下约 528px，取 560。 */
+private val CONTINUE_DECODE_PX = 560
 
 // ---------------------------------------------------------------- 海报墙 tab
 
@@ -722,8 +737,14 @@ internal fun PosterCell(
                 .clip(RoundedCornerShape(11.dp))
                 .background(MaterialTheme.colorScheme.surfaceContainer),
         ) {
+            // 必须指定解码尺寸：三列海报每格约 120dp，不指定时 Coil 按原图分辨率
+            // 解码（缩略图常 1000px+），滚动时大量 Bitmap 分配 + GC 抖动 → 掉帧。
             AsyncImage(
-                model = m.thumbPath?.let { java.io.File(it) },
+                model = ImageRequest.Builder(LocalContext.current)
+                    .data(m.thumbPath?.let { java.io.File(it) })
+                    .size(POSTER_DECODE_PX)
+                    .crossfade(false)
+                    .build(),
                 contentDescription = m.displayName,
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.fillMaxSize(),

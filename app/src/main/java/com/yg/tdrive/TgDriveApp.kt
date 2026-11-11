@@ -11,12 +11,34 @@ import com.yg.tgdrive.td.AuthState
  * Application 入口：初始化 ServiceLocator + 冷启动恢复链。
  * 恢复链：已保存代理 → 应用代理；凭据（自定义或内置默认）→ TDLib initialize（恢复会话）。
  */
-class TgDriveApp : Application() {
+class TgDriveApp : Application(), coil.ImageLoaderFactory {
 
     private companion object {
         /** 冷启动每一步的上限，避免任一步挂起把整条恢复链堵死。 */
         const val STARTUP_STEP_TIMEOUT_MS = 30_000L
     }
+
+    /**
+     * 全局 Coil ImageLoader：海报墙滚动的性能底座。
+     *
+     * 默认 ImageLoader 的两个问题：
+     * 1. 内存缓存按"默认可用内存的百分比"分配，在 1080p 三列网格里很快被顶满，
+     *    滚动时反复解码；
+     * 2. 磁盘缓存开在默认目录，缩略图本来就落在 app cache，等于同一份数据存两处。
+     *
+     * 这里显式给内存缓存 25%（约 100MB 上限，可放几百张 400px 位图），
+     * 磁盘缓存关掉（缩略图是本地文件，走 File 直读，不需要 Coil 再缓存一层）。
+     */
+    override fun newImageLoader(): coil.ImageLoader =
+        coil.ImageLoader.Builder(this)
+            .memoryCache {
+                coil.memory.MemoryCache.Builder(this)
+                    .maxSizePercent(0.25)
+                    .build()
+            }
+            .diskCachePolicy(coil.request.CachePolicy.DISABLED)
+            .crossfade(false)
+            .build()
 
     override fun onCreate() {
         super.onCreate()
