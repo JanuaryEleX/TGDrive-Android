@@ -34,6 +34,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import com.yg.tgdrive.BuildConfig
 import androidx.compose.ui.unit.dp
 import com.yg.tgdrive.ServiceLocator
 import com.yg.tgdrive.ui.common.ProxyEditor
@@ -41,8 +42,8 @@ import com.yg.tgdrive.ui.common.ProxyMode
 import kotlinx.coroutines.launch
 
 /**
- * 四步向导（SPEC §4.5 简化版）：凭据内置（Telegram Desktop 公开值）零填写，
- * 主流程 = 欢迎 → 代理（可选）→ 登录 → 驱动器勾选。
+ * 四步向导（SPEC §4.5 简化版）：debug 构建凭据内置、零填写；release 构建登录前需填
+ * 自己的 api_id/api_hash。主流程 = 欢迎 → 代理（可选）→ 登录 → 驱动器勾选。
  * 引导期间屏蔽系统返回（防误触退出后状态半途丢失）。
  */
 @Composable
@@ -116,7 +117,11 @@ private fun WelcomeStep(onNext: () -> Unit) {
         )
         Spacer(Modifier.height(16.dp))
         Text(
-            "API 凭据已内置，无需申请——直接登录即可使用。",
+            if (BuildConfig.DEBUG) {
+                "API 凭据已内置（开发构建），可直接登录。"
+            } else {
+                "首次登录需填写你自己申请的 api_id / api_hash。"
+            },
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.primary,
         )

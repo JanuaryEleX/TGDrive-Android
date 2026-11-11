@@ -4,24 +4,38 @@ import android.content.Context
 import android.content.SharedPreferences
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
+import com.yg.tgdrive.BuildConfig
 
 /**
  * api_id / api_hash 加密存储。
- * 默认内置 Telegram Desktop 官方开源仓库公开的凭据（第三方客户端通用做法），
- * 用户零填写即可登录；高级用户仍可在引导/设置中写入自定义凭据覆盖内置值。
+ *
+ * 凭据来源按构建类型区分：
+ * - debug：自定义优先，未设置时回退内置开发凭据（开发者本机零配置登录）；
+ * - release：不内置任何凭据，未设置时 [getOrBuiltIn] 返回 null，必须先由用户填写。
+ *
+ * 不在 release 内置的原因：内置值属于开发者在 my.telegram.org 注册的个人 app，
+ * 多人共用会摊薄该 api_id 的登录配额（限流维度为 api_id+号码），且违反
+ * Telegram「One api_id per account」，有封号风险。
  */
 class CredentialsStore(context: Context) {
 
     companion object {
         /**
-         * 本项目自有 api 凭据（my.telegram.org 注册的 app，属主账号私有）。
-         * 实测有效：auth.sendCode 通过配对校验（返回 SEND_OK）。
-         * 注意：api_hash 等同应用密码，泄露即可被他人消耗配额；如需轮换，
-         * 去 my.telegram.org 删除并重建 app，然后改这两个常量或在设置页覆盖。
+         * 开发用 api 凭据（my.telegram.org 注册的 app，属主账号私有）。
+         * 仅 debug 构建读取；release 构建经 R8 死代码消除后不进入 dex。
          */
         const val BUILT_IN_API_ID = 0
         const val BUILT_IN_API_HASH = "REDACTED"
+
     }
+
+    /**
+     * 内置凭据只对 debug 生效。`BuildConfig.DEBUG` 是**编译期常量**：
+     * release 下该分支折叠为 null，两个字面量失去引用，被 R8 一并删除、不进 dex。
+     * （不要改成运行时判断如 FLAG_DEBUGGABLE——那样常量有运行时引用，字面量会留在包里。）
+     */
+    private val builtIn: Pair<Int, String>? =
+        if (BuildConfig.DEBUG) (BUILT_IN_API_ID to BUILT_IN_API_HASH) else null
 
     private val prefs: SharedPreferences by lazy {
         val masterKey = MasterKey.Builder(context)
@@ -42,8 +56,11 @@ class CredentialsStore(context: Context) {
         return id to hash
     }
 
-    /** 登录用凭据：自定义优先，否则内置默认（免填登录）。 */
-    fun getOrBuiltIn(): Pair<Int, String> = get() ?: (BUILT_IN_API_ID to BUILT_IN_API_HASH)
+    /** 登录用凭据：自定义优先，否则 debug 内置值；release 未配置时为 null。 */
+    fun getOrBuiltIn(): Pair<Int, String>? = get() ?: builtIn
+
+    /** 当前构建是否携带内置凭据（设置页据此决定是否展示「恢复内置」）。 */
+    fun builtInCreds(): Pair<Int, String>? = builtIn
 
     fun set(apiId: Int, apiHash: String) {
         prefs.edit()

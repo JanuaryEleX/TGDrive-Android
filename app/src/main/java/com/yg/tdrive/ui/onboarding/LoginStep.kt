@@ -16,6 +16,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -23,9 +24,11 @@ import androidx.compose.ui.unit.dp
 import com.yg.tgdrive.ServiceLocator
 import com.yg.tgdrive.td.AuthState
 import com.yg.tgdrive.td.tdObj
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * 登录步骤（onboarding 第④步）：随 TdClient.authState 状态机切换
@@ -34,18 +37,30 @@ import kotlinx.coroutines.launch
 @Composable
 fun LoginStepContent(onReady: () -> Unit) {
     val authState by ServiceLocator.tdClient.authState.collectAsState()
+    // release 构建未内置凭据：getOrBuiltIn() 为 null 时必须先让用户填写，不能 initialize。
+    var creds by remember { mutableStateOf(ServiceLocator.credentials.getOrBuiltIn()) }
 
-    // 进入登录步骤：应用已保存代理 + TDLib initialize（幂等，冷启动已跑也安全）
-    LaunchedEffect(Unit) {
+    // 有凭据才 initialize（幂等，冷启动已跑也安全）；保存新凭据后 key 变化，自动续跑。
+    LaunchedEffect(creds) {
+        val pair = creds ?: return@LaunchedEffect
         val sl = ServiceLocator
         // 先 initialize 再应用代理：TDLib 未初始化时 addProxy 可能不被应答
-        val (apiId, apiHash) = sl.credentials.getOrBuiltIn()
         runCatching {
-            sl.tdClient.initialize(apiId, apiHash, sl.tdDatabaseDir, sl.tdFilesDir)
+            sl.tdClient.initialize(pair.first, pair.second, sl.tdDatabaseDir, sl.tdFilesDir)
         }
         sl.settings.proxy.first()?.let { snapshot ->
             runCatching { sl.proxyManager.applySnapshot(snapshot, sl.context) }
         }
+    }
+
+    if (creds == null) {
+        ApiCredentialsStep(
+            onSave = { apiId, apiHash ->
+                withContext(Dispatchers.IO) { ServiceLocator.credentials.set(apiId, apiHash) }
+                creds = apiId to apiHash
+            }
+        )
+        return
     }
 
     when (val s = authState) {
@@ -81,6 +96,70 @@ fun LoginStepContent(onReady: () -> Unit) {
         is AuthState.Closed -> StepScaffold(title = "会话已关闭") {
             Text("请重启应用恢复登录。", color = MaterialTheme.colorScheme.error)
         }
+    }
+}
+
+// ------------------------------------------------ API 凭据（release 未内置时）
+
+private val ApiHashPattern = Regex("^[0-9a-fA-F]{32}$")
+
+/**
+ * release 构建未内置 api 凭据：先让用户用自己的 Telegram 账号申请 app 再填写。
+ * 保存成功后由上层写 CredentialsStore 并继续 initialize；校验不通过时禁用保存。
+ */
+@Composable
+private fun ApiCredentialsStep(onSave: suspend (Int, String) -> Unit) {
+    var idText by remember { mutableStateOf("") }
+    var hashText by remember { mutableStateOf("") }
+    var saving by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+
+    val apiId = idText.trim().toIntOrNull()
+    val idOk = apiId != null && apiId > 0
+    val hashOk = ApiHashPattern.matches(hashText.trim())
+    val canSave = idOk && hashOk && !saving
+
+    StepScaffold(title = "填写 API 凭据") {
+        Text(
+            "当前版本未内置 API 凭据。请用自己的 Telegram 账号登录 my.telegram.org，" +
+                "进入「API development tools」创建一个应用，然后复制该应用的 api_id 与 api_hash。",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        OutlinedField(
+            value = idText,
+            onValueChange = { idText = it },
+            label = "api_id（正整数）",
+            isNumber = true,
+            supportingText = if (idText.isNotBlank() && !idOk) "api_id 必须是正整数" else null,
+        )
+        OutlinedField(
+            value = hashText,
+            onValueChange = { hashText = it },
+            label = "api_hash（32 位十六进制）",
+            isPassword = true,
+            supportingText = if (hashText.isNotBlank() && !hashOk) "api_hash 必须是 32 位十六进制" else null,
+        )
+        Spacer(Modifier.height(8.dp))
+        Button(
+            onClick = {
+                val id = apiId ?: return@Button
+                val hash = hashText.trim().lowercase()
+                if (saving || !canSave) return@Button
+                saving = true
+                scope.launch {
+                    // 写盘失败时恢复按钮，避免表单永久卡在「正在保存…」
+                    runCatching { onSave(id, hash) }.onFailure { saving = false }
+                }
+            },
+            enabled = canSave,
+            modifier = Modifier.fillMaxWidth(),
+        ) { Text(if (saving) "正在保存…" else "保存并登录") }
+        Text(
+            "凭据仅加密保存在本机，用于连接你自己的 Telegram 应用。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 

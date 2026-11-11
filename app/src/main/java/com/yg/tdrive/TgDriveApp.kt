@@ -26,12 +26,18 @@ class TgDriveApp : Application() {
             // 顺序关键：TDLib 收到 setTdlibParameters 之前不会正常应答其它请求。
             // 旧顺序（先 applySnapshot 后 initialize）下 addProxy 的 await 永久挂起，
             // initialize 永远执行不到，authState 卡在 Loading（界面一直"正在连接 Telegram…"）。
-            val (apiId, apiHash) = sl.credentials.getOrBuiltIn()
-            runCatching {
-                withTimeoutOrNull(STARTUP_STEP_TIMEOUT_MS) {
-                    sl.tdClient.initialize(apiId, apiHash, sl.tdDatabaseDir, sl.tdFilesDir)
-                }
-            }.onFailure { Log.e("TgDriveApp", "TDLib initialize failed", it) }
+            // release 构建未内置凭据且用户未填写时 getOrBuiltIn() 为 null：
+            // 跳过 initialize（登录步会先收凭据），其余恢复链（代理/看门狗/回填）照常。
+            val creds = sl.credentials.getOrBuiltIn()
+            if (creds != null) {
+                runCatching {
+                    withTimeoutOrNull(STARTUP_STEP_TIMEOUT_MS) {
+                        sl.tdClient.initialize(
+                            creds.first, creds.second, sl.tdDatabaseDir, sl.tdFilesDir
+                        )
+                    }
+                }.onFailure { Log.e("TgDriveApp", "TDLib initialize failed", it) }
+            }
             runCatching {
                 sl.settings.proxy.first()?.let { snapshot ->
                     withTimeoutOrNull(STARTUP_STEP_TIMEOUT_MS) {
@@ -47,11 +53,15 @@ class TgDriveApp : Application() {
             }
             if (ready == null) {
                 Log.w("TgDriveApp", "authState not Ready after 25s, retrying init + proxy")
-                runCatching {
-                    withTimeoutOrNull(STARTUP_STEP_TIMEOUT_MS) {
-                        sl.tdClient.initialize(apiId, apiHash, sl.tdDatabaseDir, sl.tdFilesDir)
-                    }
-                }.onFailure { Log.e("TgDriveApp", "retry initialize failed", it) }
+                if (creds != null) {
+                    runCatching {
+                        withTimeoutOrNull(STARTUP_STEP_TIMEOUT_MS) {
+                            sl.tdClient.initialize(
+                                creds.first, creds.second, sl.tdDatabaseDir, sl.tdFilesDir
+                            )
+                        }
+                    }.onFailure { Log.e("TgDriveApp", "retry initialize failed", it) }
+                }
                 runCatching {
                     sl.settings.proxy.first()?.let { snapshot ->
                         withTimeoutOrNull(STARTUP_STEP_TIMEOUT_MS) {

@@ -32,7 +32,12 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = "17" }
-    buildFeatures { compose = true }
+    buildFeatures {
+        compose = true
+        // 需要 BuildConfig.DEBUG：内置 api 凭据只在 debug 生效，
+        // release 下该分支被 R8 折叠为 null，字面量随之被删除（不进 dex）。
+        buildConfig = true
+    }
     packaging {
         jniLibs { useLegacyPackaging = false }
     }
