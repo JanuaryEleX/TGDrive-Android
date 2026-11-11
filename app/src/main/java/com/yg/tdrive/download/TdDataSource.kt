@@ -10,6 +10,7 @@ import java.io.File
 import java.io.IOException
 import java.io.RandomAccessFile
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Media3 DataSource（SPEC §4.4）：把 ExoPlayer 的 open/read/close 翻译到
@@ -37,6 +38,19 @@ class TdDataSource(
 
         /** ensureRange 预热长度（open 起播 / read 跨窗口时先保证数据）。 */
         private const val PREHEAT = 512L * 1024
+
+        /**
+         * open() 预热的等待上限。必须显著小于 ExoPlayer 对 load 阻塞的容忍度
+         * （否则它会 cancelLoading → 中断线程 → 报错 → 重试丢位置）。
+         * 预热只是"把请求发出去"，真正的等待交给 read()。
+         */
+        private const val OPEN_WARMUP_MS = 3_000L
+
+        /**
+         * read() 单次等待上限。要小于 ExoPlayer 判定 load 卡死的阈值，
+         * 超时即抛可重试异常，交给播放器自己重试（数据仍在后台下载）。
+         */
+        private const val READ_WAIT_MS = 8_000L
 
         /** 解析标记 URI → (fileId, size, uid)。非本 scheme 抛 IOException。 */
         fun parseUri(uri: Uri): Triple<Int, Long, String?> {
@@ -118,8 +132,11 @@ class TdDataSource(
             return C.LENGTH_UNSET.toLong()
         }
 
-        // open 预热：挂起等待起播头部落盘（失败即抛 → ExoPlayer 错误覆盖层）
-        ensureRangeBlocking(position, PREHEAT)
+        // open 预热：只为把下载请求发出去 + 短暂等首包。
+        // 这里**不能**长等：ExoPlayer 的 load 线程对 open/read 的阻塞有容忍上限，
+        // 一旦超时它会 cancelLoading() → 中断线程 → 抛错 → 自动重试 → 位置丢失。
+        // 所以预热只等一小会儿，没等到就让 read() 去逐段等（read 可短等多次）。
+        ensureRangeBlocking(position, PREHEAT, OPEN_WARMUP_MS)
         opened = true
 
         // 返回值 = 本次可读长度（DataSpec 未定长且总长已知时报告剩余，利于 MP4 定长 box 解析）
@@ -205,18 +222,38 @@ class TdDataSource(
     // ═══════════════════════ 内部 ═══════════════════════
 
     /** ensureRange 挂起包装：加载线程被取消（close/释放）→ 转 IOException。 */
-    private fun ensureRangeBlocking(pos: Long, len: Long) {
+    private fun ensureRangeBlocking(pos: Long, len: Long, maxWaitMs: Long = Long.MAX_VALUE) {
         try {
-            runBlocking { mgr.ensureRange(fileId, pos, len, tag = "stream") }
+            runBlocking {
+                if (maxWaitMs == Long.MAX_VALUE) {
+                    mgr.ensureRange(fileId, pos, len, tag = "stream")
+                } else {
+                    withTimeoutOrNull(maxWaitMs) {
+                        mgr.ensureRange(fileId, pos, len, tag = "stream")
+                    }
+                }
+            }
         } catch (ie: InterruptedException) {
             Thread.currentThread().interrupt()
             throw IOException("读取被取消 file=$fileId", ie)
         }
     }
 
-    /** ensureRange 的引用版本（read 内每个位置都要等真实落盘）。 */
+    /**
+     * ensureRange 的引用版本（read 内每个位置都要等真实落盘）。
+     *
+     * 单次等待上限 [READ_WAIT_MS]：ExoPlayer 的 load 线程被阻塞过久会被 cancelLoading()
+     * 打断（线程中断 → runBlocking 抛 CancellationException → 播放中断 → 重试丢位置）。
+     * 超时后抛 [RetryLaterException]，让 ExoPlayer 走正常的"重试同一 load"路径，
+     * 而不是整条播放链路崩掉。数据仍在后台下载，下次 read 就能拿到。
+     */
     private fun ensureRangeRef(pos: Long, len: Long): PartialRef = try {
-        runBlocking { mgr.ensureRange(fileId, pos, len, tag = "stream") }
+        val ref = runBlocking {
+            withTimeoutOrNull(READ_WAIT_MS) {
+                mgr.ensureRange(fileId, pos, len, tag = "stream")
+            }
+        }
+        ref ?: throw RetryLaterException("file=$fileId pos=$pos 数据尚未就绪（${READ_WAIT_MS}ms）")
     } catch (ie: InterruptedException) {
         Thread.currentThread().interrupt()
         throw IOException("读取被取消 file=$fileId", ie)
@@ -241,3 +278,11 @@ class TdDataSourceFactory(
 ) : DataSource.Factory {
     override fun createDataSource(): TdDataSource = TdDataSource(mgr)
 }
+
+/**
+ * "数据还没到，但这是暂时的" —— 抛给 ExoPlayer，让它重试本次 load 而不是终止播放。
+ *
+ * 必须继承 [java.io.IOException]：ExoPlayer 把非 IOException 当作致命错误。
+ * 配合默认 LoadErrorHandlingPolicy 的重试即可自动恢复，播放位置也不会丢。
+ */
+class RetryLaterException(message: String) : java.io.IOException(message)

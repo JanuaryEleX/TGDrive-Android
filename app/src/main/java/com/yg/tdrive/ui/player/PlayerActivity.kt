@@ -143,6 +143,12 @@ class PlayerActivity : ComponentActivity() {
     private var speedBoosted = false
     private var fillMode = 0
     private var autoRetry = 0
+
+    /**
+     * 重试时要恢复到的位置。播放中断后 player 已被 release，currentPosition 归零，
+     * 所以必须在报错前把位置抓下来，否则重试会从头 prepare（用户看到"跳回开头"）。
+     */
+    private var retryResumeMs = 0L
     private var preparing = false
     private var queue: LongArray = LongArray(0)
     private var queueIndex = -1
@@ -379,6 +385,9 @@ class PlayerActivity : ComponentActivity() {
             if (prog != null && !prog.finished && prog.positionMs > RESUME_MIN_MS) {
                 resumeMs = prog.positionMs
             }
+        } else if (retryResumeMs > 0L) {
+            // 自动重试：从断点续播，不跳回开头
+            resumeMs = retryResumeMs
         }
         if (resumeMs > 0) {
             p.seekTo(resumeMs)
@@ -443,6 +452,7 @@ class PlayerActivity : ComponentActivity() {
     }
 
     fun retry() {
+        retryResumeMs = player?.currentPosition?.coerceAtLeast(0L) ?: retryResumeMs
         autoRetry = 0
         errorText.value = null
         loading.value = true
@@ -469,6 +479,8 @@ class PlayerActivity : ComponentActivity() {
         preparing = false
         if (autoRetry < MAX_AUTO_RETRY) {
             autoRetry++
+            // 抓当前位置：重试必须从断点继续，不能跳回开头
+            retryResumeMs = player?.currentPosition?.coerceAtLeast(0L) ?: retryResumeMs
             hudText.value = "播放中断，正在重试 $autoRetry/$MAX_AUTO_RETRY"
             lifecycleScope.launch {
                 delay(1_200L * autoRetry)
