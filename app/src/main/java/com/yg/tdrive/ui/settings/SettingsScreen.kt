@@ -209,7 +209,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                                     }
                                     ScanDiagnostics.reset()
                                     ServiceLocator.mediaRepository.fullScan(drive.id)
-                                    diagState = "完成 → $report"
+                                    diagState = "结束 → $report\n${ScanDiagnostics.summary()}"
                                 } catch (t: Throwable) {
                                     diagState = "失败：${t.message ?: t.javaClass.simpleName}"
                                 } finally {
@@ -219,7 +219,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                         },
                         enabled = !diagRunning,
                         modifier = Modifier.fillMaxWidth(),
-                    ) { Text("重扫并生成诊断报告") }
+                    ) { Text("重扫并生成诊断报告（含相册封面）") }
                     diagState?.let {
                         Spacer(Modifier.height(4.dp))
                         Text(

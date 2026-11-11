@@ -214,6 +214,58 @@ interface MediaDao {
     @Query("SELECT COUNT(*) FROM media WHERE drive_id = :driveId AND thumb_path IS NULL")
     suspend fun countMissingThumb(driveId: Long): Int
 
+    /** 缺封面行计数（按 kind，诊断用）。 */
+    @Query(
+        """SELECT COUNT(*) FROM media
+           WHERE drive_id = :driveId AND kind = :kind AND thumb_path IS NULL"""
+    )
+    suspend fun countMissingThumbByKind(driveId: Long, kind: String): Int
+
+    /** 第二阶段补抓：缺封面的图片行（相册图封面必须先于视频分配补齐）。 */
+    @Query(
+        """SELECT * FROM media
+           WHERE drive_id = :driveId AND kind = 'image' AND thumb_path IS NULL"""
+    )
+    suspend fun imagesMissingThumb(driveId: Long): List<MediaEntity>
+
+    /** 第二阶段补抓：仍缺封面的视频行（相册无图封面 / 自身封面下载失败）。 */
+    @Query(
+        """SELECT * FROM media
+           WHERE drive_id = :driveId AND kind = 'video' AND thumb_path IS NULL"""
+    )
+    suspend fun videosMissingThumb(driveId: Long): List<MediaEntity>
+
+    /**
+     * 相册优先封面：每条视频 → 同相册组内 `message_id` 最小的**已下载**图片封面。
+     * 子查询按 message_id ASC LIMIT 1 取相册首图（视觉上最接近 Telegram 相册）；
+     * 同组无可用图封面时 thumbPath 为 NULL，调用方回退视频自身封面。
+     */
+    @Query(
+        """
+        SELECT v.id AS videoId,
+               (
+                   SELECT i.thumb_path FROM media i
+                   WHERE i.media_album_id = v.media_album_id
+                     AND i.kind = 'image'
+                     AND i.thumb_path IS NOT NULL
+                   ORDER BY i.message_id ASC
+                   LIMIT 1
+               ) AS thumbPath
+        FROM media v
+        WHERE v.drive_id = :driveId
+          AND v.kind = 'video'
+          AND v.media_album_id IS NOT NULL
+        """
+    )
+    suspend fun videoAlbumCovers(driveId: Long): List<VideoAlbumCover>
+
+    /** 幂等写封面：仅当值变化时 UPDATE（重复扫描不产生写放大）。 */
+    @Query(
+        """UPDATE media SET thumb_path = :thumbPath
+           WHERE id = :id AND (thumb_path IS NULL OR thumb_path != :thumbPath)"""
+    )
+    suspend fun updateThumbPathIfChanged(id: Long, thumbPath: String): Int
+
     /** 清空某驱动器内缺封面行的 thumb_path，让下一轮扫描重新补抓。 */
     @Query("UPDATE media SET thumb_path = NULL WHERE drive_id = :driveId AND thumb_path IS NULL")
     suspend fun noopClearMissingThumb(driveId: Long)
@@ -269,14 +321,23 @@ interface MediaDao {
 
     /**
      * 回填：按 (chat_id, message_id) 写相册 ID，且只在尚未回填时生效。
-     * 返回受影响行数（0 = 库里没这条 / 已回填过）。
+     * `:albumId IS NOT NULL` 是必要的：非相册消息的 media_album_id 归一化为 NULL，
+     * 若不排除，UPDATE NULL→NULL 仍算命中，重复页会把「处理数」刷虚（4051 > 实际缺失 1096）。
+     * 返回受影响行数（0 = 库里没这条 / 已回填过 / 本身不是相册消息）。
      */
     @Query(
         """UPDATE media SET media_album_id = :albumId
-           WHERE chat_id = :chatId AND message_id = :messageId AND media_album_id IS NULL"""
+           WHERE chat_id = :chatId AND message_id = :messageId
+             AND media_album_id IS NULL AND :albumId IS NOT NULL"""
     )
     suspend fun backfillAlbumId(chatId: Long, messageId: Long, albumId: Long?): Int
 }
+
+/** 视频 → 同相册首图封面路径（相册无可用图封面时 thumbPath 为 NULL）。 */
+data class VideoAlbumCover(
+    val videoId: Long,
+    val thumbPath: String?,
+)
 
 /** 相册 → 组内视频时长（角标用）。 */
 data class AlbumVideoInfo(

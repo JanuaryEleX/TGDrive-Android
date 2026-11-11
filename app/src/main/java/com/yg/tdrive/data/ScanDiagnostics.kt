@@ -35,7 +35,11 @@ import java.util.concurrent.atomic.AtomicLong
  * - drops              = parseMedia 各失败出口的命中次数（按处理次数）
  * - parsed/parsedUnique= 解析成功（按次数 / 按去重消息），并分 kind
  * - dbCountByKind      = 扫描结束时 DB 里该驱动器 media.kind 的实际行数
- * - pages/repeatedPages/maxPageRepeats = 翻页与同页重取情况（fullScan 短页重试上限 30 次）
+ * - pages/repeatedPages/maxPageRepeats = 翻页与同页重取情况（同页重试上限 1 次 → ≤2）
+ * - covers             = 扫描结束时的封面统计（相册优先两阶段补齐后的真值）
+ *
+ * 注：MediaRepository 现在按 message_id 去重后再解析，同一页**不会**被重复解析；
+ * 因此 parsedByKind 应等于 parsedUniqueByKind，contentTypesAll 应等于 contentTypes。
  */
 object ScanDiagnostics {
 
@@ -79,6 +83,7 @@ object ScanDiagnostics {
     private val parsedByKind = ConcurrentHashMap<String, Long>()
     private val parsedUniqueByKind = ConcurrentHashMap<String, Long>()
     private val dbCounts = ConcurrentHashMap<String, Long>()
+    private val covers = ConcurrentHashMap<String, Long>()
     private val pageRequests = ConcurrentHashMap<Long, Long>()
     private val seenMessageIds: MutableSet<Long> = ConcurrentHashMap.newKeySet()
 
@@ -109,6 +114,7 @@ object ScanDiagnostics {
         parsedByKind.clear()
         parsedUniqueByKind.clear()
         dbCounts.clear()
+        covers.clear()
         pageRequests.clear()
         seenMessageIds.clear()
         samples.clear()
@@ -184,6 +190,19 @@ object ScanDiagnostics {
         counts.forEach { (k, v) -> dbCounts[k] = v.toLong() }
     }
 
+    /** 扫描结束时封面统计（videoMissingThumb/imageMissingThumb/videoAlbumCover）。 */
+    fun covers(counts: Map<String, Int>) {
+        covers.clear()
+        counts.forEach { (k, v) -> covers[k] = v.toLong() }
+    }
+
+    /** 一行摘要（设置页诊断按钮回显；区分 DONE / ERROR 用 errorText）。 */
+    fun summary(): String {
+        val parts = covers.toSortedMap().map { (k, v) -> "$k=$v" }
+        val err = errorText?.let { "error=$it" } ?: "ok"
+        return (listOf(err) + parts).joinToString(" ")
+    }
+
     fun error(message: String?) {
         errorText = message
     }
@@ -239,6 +258,7 @@ object ScanDiagnostics {
                 put("parsedByKind", longObj(parsedByKind))
                 put("parsedUniqueByKind", longObj(parsedUniqueByKind))
                 put("dbCountByKind", longObj(dbCounts))
+                put("covers", longObj(covers))
                 put("contentTypes", longObj(contentTypes))
                 put("contentTypesAll", longObj(contentTypesAll))
                 put("drops", longObj(drops))
@@ -273,8 +293,8 @@ object ScanDiagnostics {
                 put("error", errorText)
                 put(
                     "note",
-                    "contentTypes/parsedUnique/pages 按去重消息统计；drops/contentTypesAll 按处理次数" +
-                        "（fullScan 短页重试会对同一页重复解析，最多 31 次）。",
+                    "全部按本轮去重消息统计；同页重试不再重复解析（maxPageRepeats ≤ 2）。" +
+                        "parsedByKind 应等于 parsedUniqueByKind，contentTypesAll 应等于 contentTypes。",
                 )
             }
             file.writeText(json.encodeToString(JsonObject.serializer(), root))
