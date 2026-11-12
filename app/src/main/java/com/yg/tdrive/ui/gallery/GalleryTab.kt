@@ -212,8 +212,8 @@ fun GalleryTab() {
                 LazyVerticalStaggeredGrid(
                     columns = StaggeredGridCells.Fixed(2),
                     contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 6.dp, bottom = 16.dp),
-                    horizontalArrangement = Arrangement.spacedBy(9.dp),
-                    verticalItemSpacing = 9.dp,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    verticalItemSpacing = 12.dp,
                     modifier = Modifier.fillMaxSize(),
                 ) {
                     items(
@@ -252,8 +252,8 @@ private fun ImageSkeletonGrid() {
     LazyVerticalStaggeredGrid(
         columns = StaggeredGridCells.Fixed(2),
         contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 6.dp, bottom = 16.dp),
-        horizontalArrangement = Arrangement.spacedBy(9.dp),
-        verticalItemSpacing = 9.dp,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        verticalItemSpacing = 12.dp,
         userScrollEnabled = false,
         modifier = Modifier.fillMaxSize(),
     ) {
