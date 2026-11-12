@@ -68,6 +68,8 @@ data class DriveEntity(
             orders = [Index.Order.ASC, Index.Order.ASC, Index.Order.DESC],
             name = "idx_media_wall",
         ),
+        // 收藏页按 favorited_at 倒序取行：无索引时全表扫描 + 临时排序。
+        Index(value = ["favorited_at"], name = "idx_media_favorited_at"),
     ],
 )
 data class MediaEntity(
@@ -122,6 +124,15 @@ data class MediaEntity(
     /** file_id 失效待重取 */
     @ColumnInfo(name = "stale", defaultValue = "0")
     val stale: Boolean = false,
+    /**
+     * 收藏时间（epoch ms），null = 未收藏。
+     *
+     * 收藏状态**落在 media 行上**（不另建表）：卸载重装只要 TDLib 目录与 DB 还在，
+     * 重扫走 insertAllIgnoring 也不会覆盖已存在行，收藏因此天然不会被扫没。
+     * 收藏页按它倒序；取消收藏即置 null（不删行，媒体本身还在库里）。
+     */
+    @ColumnInfo(name = "favorited_at")
+    val favoritedAt: Long? = null,
 )
 
 /**

@@ -381,6 +381,38 @@ interface MediaDao {
              AND media_album_id IS NULL AND :albumId IS NOT NULL"""
     )
     suspend fun backfillAlbumId(chatId: Long, messageId: Long, albumId: Long?): Int
+
+    // ── 收藏（favorited_at，v3→v4）─────────────────────────────────────────
+    // 只追加：不修改任何既有查询，收藏逻辑由 FavoritesRepository 统一封装。
+
+    /**
+     * 收藏页数据源：已收藏媒体（视频+图片混排）按收藏时间倒序分页。
+     * 排序与 FavoritesPolicy.orderByFavoriteTime 的契约一致：favorited_at DESC，同刻按 id DESC。
+     * `favorited_at IS NOT NULL` 直接命中 idx_media_favorited_at。
+     */
+    @Query(
+        """
+        SELECT * FROM media
+        WHERE favorited_at IS NOT NULL
+        ORDER BY favorited_at DESC, id DESC
+        """
+    )
+    fun observeFavoritesPaged(): PagingSource<Int, MediaEntity>
+
+    /** 某行当前的收藏时间（null = 未收藏 / 行不存在）。切换收藏前先读它。 */
+    @Query("SELECT favorited_at FROM media WHERE id = :id LIMIT 1")
+    suspend fun favoritedAtOf(id: Long): Long?
+
+    /** 写收藏时间（null = 取消收藏）。返回受影响行数（0 = 行已被删除）。 */
+    @Query("UPDATE media SET favorited_at = :favoritedAt WHERE id = :id")
+    suspend fun setFavoritedAt(id: Long, favoritedAt: Long?): Int
+
+    /**
+     * 全部收藏行的 (id, favorited_at)：播放队列按收藏时间倒序在这里算。
+     * 只取两列，几千条收藏也只是几十 KB，比按分页已加载项拼队列更准（不受 400 条上限影响）。
+     */
+    @Query("SELECT id, favorited_at FROM media WHERE favorited_at IS NOT NULL")
+    suspend fun favoriteRows(): List<FavoriteRow>
 }
 
 /** 视频 → 同相册首图封面路径（相册无可用图封面时 thumbPath 为 NULL）。 */

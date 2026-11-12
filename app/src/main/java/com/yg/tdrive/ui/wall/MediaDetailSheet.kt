@@ -29,6 +29,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -48,6 +49,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import com.yg.tgdrive.ServiceLocator
+import com.yg.tgdrive.data.FavoritesPolicy
 import com.yg.tgdrive.ui.common.AppIcons
 import com.yg.tgdrive.ui.common.MediaEntity
 import com.yg.tgdrive.ui.common.formatDate
@@ -74,6 +76,13 @@ fun MediaDetailSheet(
     var showRename by remember { mutableStateOf(false) }
     var showDeleteConfirm by remember { mutableStateOf(false) }
     var actionError by remember { mutableStateOf<String?>(null) }
+    // 收藏状态：先取网格快照，进弹层后再按 DB 刷一次（分页快照可能已经过期）
+    var favoritedAt by remember(media.id) { mutableStateOf(media.favoritedAt) }
+
+    LaunchedEffect(media.id) {
+        val fresh = runCatching { ServiceLocator.favoritesRepository.favoritedAt(media.id) }
+        if (fresh.isSuccess) favoritedAt = fresh.getOrNull()
+    }
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -201,6 +210,21 @@ fun MediaDetailSheet(
                 Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceEvenly,
             ) {
+                val favorited = FavoritesPolicy.isFavorited(favoritedAt)
+                IconAction(
+                    icon = if (favorited) AppIcons.Star else AppIcons.StarOutline,
+                    label = if (favorited) "已收藏" else "收藏",
+                    active = favorited,
+                ) {
+                    scope.launch {
+                        try {
+                            // 写库即生效：收藏 tab 的 PagingSource 由 Room 自动失效重载
+                            favoritedAt = ServiceLocator.favoritesRepository.toggle(media.id)
+                        } catch (t: Throwable) {
+                            actionError = "收藏失败：${t.message}"
+                        }
+                    }
+                }
                 IconAction(AppIcons.Download, "下载") {
                     ServiceLocator.offlineDownloads.enqueue(media)
                     android.widget.Toast.makeText(
@@ -320,9 +344,16 @@ private fun IconAction(
     icon: ImageVector,
     label: String,
     danger: Boolean = false,
+    /** 已选中态（收藏）：图标与底色改用强调色，与普通动作区分。 */
+    active: Boolean = false,
     onClick: () -> Unit,
 ) {
-    val tint = if (danger) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface
+    val accent = MaterialTheme.colorScheme.primary
+    val tint = when {
+        danger -> MaterialTheme.colorScheme.error
+        active -> accent
+        else -> MaterialTheme.colorScheme.onSurface
+    }
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
         modifier = Modifier
@@ -335,10 +366,10 @@ private fun IconAction(
                 .size(44.dp)
                 .clip(CircleShape)
                 .background(
-                    if (danger) {
-                        MaterialTheme.colorScheme.error.copy(alpha = 0.12f)
-                    } else {
-                        MaterialTheme.colorScheme.surfaceContainerHigh
+                    when {
+                        danger -> MaterialTheme.colorScheme.error.copy(alpha = 0.12f)
+                        active -> accent.copy(alpha = 0.16f)
+                        else -> MaterialTheme.colorScheme.surfaceContainerHigh
                     }
                 ),
             contentAlignment = Alignment.Center,

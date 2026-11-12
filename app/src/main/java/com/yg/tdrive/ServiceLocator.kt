@@ -6,6 +6,7 @@ import android.util.Log
 import androidx.room.Room
 import com.yg.tgdrive.data.AppDatabase
 import com.yg.tgdrive.data.DriveManager
+import com.yg.tgdrive.data.FavoritesRepository
 import com.yg.tgdrive.data.MediaRepository
 import com.yg.tgdrive.data.PlaybackProgressDao
 import com.yg.tgdrive.download.OfflineDownloadManager
@@ -91,6 +92,10 @@ object ServiceLocator {
     lateinit var playbackProgressDao: PlaybackProgressDao
         private set
 
+    /** 收藏仓库（v3→v4：media.favorited_at，收藏 tab 唯一数据来源）。 */
+    lateinit var favoritesRepository: FavoritesRepository
+        private set
+
     // ---- 下载层 ----
     lateinit var downloadManager: StreamingDownloadManager
         private set
@@ -128,12 +133,17 @@ object ServiceLocator {
             proxyManager = TdProxyManager(tdClient)
 
             appDatabase = Room.databaseBuilder(app, AppDatabase::class.java, DB_NAME)
-                .addMigrations(AppDatabase.MIGRATION_1_2, AppDatabase.MIGRATION_2_3)
+                .addMigrations(
+                    AppDatabase.MIGRATION_1_2,
+                    AppDatabase.MIGRATION_2_3,
+                    AppDatabase.MIGRATION_3_4,
+                )
                 .build()
             // 三参构造：appContext 供缩略图落盘（cacheDir/thumbs）与 clearCache 使用
             mediaRepository = MediaRepository(appDatabase, tdClient, app)
             driveManager = DriveManager(appDatabase, tdClient)
             playbackProgressDao = appDatabase.playbackProgressDao()
+            favoritesRepository = FavoritesRepository(appDatabase)
 
             // 下载层：并发 Flow 由 manager 内部 collect 实现 1~8 滑杆热更（SPEC §4.3 Q28）
             downloadManager = StreamingDownloadManager(

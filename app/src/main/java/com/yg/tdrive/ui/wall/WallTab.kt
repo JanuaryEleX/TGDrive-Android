@@ -42,12 +42,14 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalConfiguration
@@ -65,12 +67,15 @@ import androidx.paging.compose.itemKey
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import com.yg.tgdrive.ServiceLocator
+import com.yg.tgdrive.data.FavoritesPolicy
+import com.yg.tgdrive.data.MediaKind
 import com.yg.tgdrive.td.AuthState
 import com.yg.tgdrive.ui.common.AppIcons
 import com.yg.tgdrive.ui.common.MediaEntity
 import com.yg.tgdrive.ui.common.formatDuration
 import com.yg.tgdrive.ui.common.formatSize
 import com.yg.tgdrive.ui.gallery.GalleryTab
+import com.yg.tgdrive.ui.gallery.GalleryViewer
 import com.yg.tgdrive.ui.nav.authLockMessage
 import com.yg.tgdrive.ui.player.openPlayer
 import com.yg.tgdrive.ui.search.FilterButton
@@ -81,7 +86,7 @@ import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
 
 /**
- * 主页：底部 3 tab（最近 / 视频 / 图片）+ 设置入口。
+ * 主页：底部 4 tab（最近 / 收藏 / 视频 / 图片）+ 设置入口。
  *
  * 视觉基线取 CloudStream / Aniyomi 一类影音应用：
  * 深色近黑底、单一强调色、海报本身承载全部信息，不再在图上叠一排黑底小方块。
@@ -94,7 +99,8 @@ fun MainScreen(
     onOpenDownload: () -> Unit = {},
 ) {
     val authState by ServiceLocator.tdClient.authState.collectAsState()
-    var tab by remember { mutableStateOf(1) } // 1 = 视频（默认）
+    // tab 序号：0=最近 1=收藏 2=视频 3=图片。默认仍落在视频（海报墙），保持老用户手感。
+    var tab by remember { mutableStateOf(2) }
 
     Column(
         modifier = Modifier
@@ -113,7 +119,8 @@ fun MainScreen(
                 Text(
                     when (tab) {
                         0 -> "最近"
-                        1 -> "视频"
+                        1 -> "收藏"
+                        2 -> "视频"
                         else -> "图片"
                     },
                     style = MaterialTheme.typography.titleLarge,
@@ -122,7 +129,8 @@ fun MainScreen(
                 Text(
                     when (tab) {
                         0 -> "最近播放与新增"
-                        1 -> "海报墙"
+                        1 -> "收藏的视频与图片"
+                        2 -> "海报墙"
                         else -> "图片流"
                     },
                     style = MaterialTheme.typography.labelSmall,
@@ -222,12 +230,13 @@ fun MainScreen(
         Box(Modifier.weight(1f)) {
             when (tab) {
                 0 -> RecentTab()
-                1 -> WallTab()
+                1 -> FavoritesTab()
+                2 -> WallTab()
                 else -> GalleryTab()
             }
         }
 
-        // ---- 底部三 tab（纯图标：文字已删，42dp 紧凑高度）----
+        // ---- 底部四 tab（纯图标：文字已删，42dp 紧凑高度）----
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -237,8 +246,9 @@ fun MainScreen(
         ) {
             val items = listOf(
                 Triple("最近", AppIcons.History, 0),
-                Triple("视频", AppIcons.Movie, 1),
-                Triple("图片", AppIcons.Image, 2),
+                Triple("收藏", AppIcons.Star, 1),
+                Triple("视频", AppIcons.Movie, 2),
+                Triple("图片", AppIcons.Image, 3),
             )
             items.forEach { (label, icon, index) ->
                 val selected = tab == index
@@ -374,6 +384,71 @@ private fun RecentGrid(items: LazyPagingItems<MediaEntity>) {
     if (detailFor != null) {
         MediaDetailSheet(media = detailFor!!, onDismiss = { detailFor = null })
     }
+}
+
+// ---------------------------------------------------------------- 收藏 tab
+
+/**
+ * 收藏：视频 + 图片混排，按收藏时间倒序（data 层 favorited_at 驱动）。
+ *
+ * 网格完全复用海报墙的 [WallGrid] / [PosterCell]（同一套列数、间距、缩略图解码尺寸），
+ * 只替换两件事：
+ * - 点击行为：视频进播放器（队列 = 全量收藏顺序，不受分页已加载条数限制）、图片进 [GalleryViewer]；
+ * - 空态文案：「还没有收藏的内容」。
+ *
+ * 取消收藏后 Room 会让 PagingSource 失效，该格自动从列表消失 —— 这里没有任何手动刷新逻辑。
+ */
+@Composable
+private fun FavoritesTab() {
+    val drives by ServiceLocator.driveManager.observeDrives().collectAsState(initial = emptyList())
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var detailFor by remember { mutableStateOf<MediaEntity?>(null) }
+    var viewerFor by remember { mutableStateOf<MediaEntity?>(null) }
+
+    // 收藏是跨驱动器的：不按 drive 过滤，混排所有频道的收藏项。
+    val flow: Flow<PagingData<MediaEntity>> = remember {
+        ServiceLocator.favoritesRepository.observeFavorites()
+    }
+    val items: LazyPagingItems<MediaEntity> = flow.collectAsLazyPagingItems()
+
+    if (drives.isEmpty()) {
+        EmptyState(
+            icon = AppIcons.Star,
+            title = "还没有驱动器",
+            subtitle = "到设置里选一个 Telegram 频道",
+        )
+        return
+    }
+
+    WallGrid(
+        items = items,
+        onInfo = { detailFor = it },
+        columns = 2,
+        emptyIcon = AppIcons.Star,
+        emptyTitle = "还没有收藏的内容",
+        emptySubtitle = "在详情里点「收藏」，视频和图片都会收进这里",
+        onPlayOverride = { target ->
+            if (target.kind == MediaKind.IMAGE) {
+                viewerFor = target
+            } else {
+                scope.launch {
+                    val queue = runCatching {
+                        ServiceLocator.favoritesRepository.favoriteQueue(target.id)
+                    }.getOrNull()
+                    openPlayer(
+                        context,
+                        target.id,
+                        queue?.ids?.toLongArray() ?: LongArray(0),
+                        queue?.index ?: -1,
+                    )
+                }
+            }
+        },
+    )
+
+    viewerFor?.let { m -> GalleryViewer(initial = m, onDismiss = { viewerFor = null }) }
+    detailFor?.let { m -> MediaDetailSheet(media = m, onDismiss = { detailFor = null }) }
 }
 
 /** 分区标题。 */
@@ -606,6 +681,12 @@ private fun WallGrid(
     items: LazyPagingItems<MediaEntity>,
     onInfo: (MediaEntity) -> Unit,
     columns: Int = 2,
+    /** 空态图标/文案：收藏 tab 复用同一网格，只换这三项（默认即海报墙原文案）。 */
+    emptyIcon: ImageVector = AppIcons.Movie,
+    emptyTitle: String = "海报墙还是空的",
+    emptySubtitle: String = "下拉刷新扫描频道\n或把视频转发进驱动器频道",
+    /** 点击行为覆盖：为空时走海报墙默认「按已加载项拼播放队列」。 */
+    onPlayOverride: ((MediaEntity) -> Unit)? = null,
 ) {
     val context = LocalContext.current
     when {
@@ -622,9 +703,9 @@ private fun WallGrid(
                     .verticalScroll(rememberScrollState()),
             ) {
                 EmptyState(
-                    icon = AppIcons.Movie,
-                    title = "海报墙还是空的",
-                    subtitle = "下拉刷新扫描频道\n或把视频转发进驱动器频道",
+                    icon = emptyIcon,
+                    title = emptyTitle,
+                    subtitle = emptySubtitle,
                 )
             }
         }
@@ -645,15 +726,19 @@ private fun WallGrid(
                             m,
                             columns = columns,
                             onPlay = { target ->
-                                val n = items.itemCount.coerceAtMost(400)
-                                val ids = ArrayList<Long>(n)
-                                var at = -1
-                                for (i in 0 until n) {
-                                    val e = items[i] ?: continue
-                                    if (e.id == target.id) at = ids.size
-                                    ids.add(e.id)
+                                if (onPlayOverride != null) {
+                                    onPlayOverride(target)
+                                } else {
+                                    val n = items.itemCount.coerceAtMost(400)
+                                    val ids = ArrayList<Long>(n)
+                                    var at = -1
+                                    for (i in 0 until n) {
+                                        val e = items[i] ?: continue
+                                        if (e.id == target.id) at = ids.size
+                                        ids.add(e.id)
+                                    }
+                                    openPlayer(context, target.id, ids.toLongArray(), at)
                                 }
-                                openPlayer(context, target.id, ids.toLongArray(), at)
                             },
                             onInfo = onInfo,
                         )
@@ -842,6 +927,28 @@ internal fun PosterCell(
                         .background(Color.Black.copy(alpha = 0.68f))
                         .padding(horizontal = 7.dp, vertical = 3.dp),
                 )
+            }
+
+            // 已收藏标记：右上角小星。
+            // 只在 favoritedAt 非空时才进 composition —— 未收藏的格子不多一个节点、不多一次绘制，
+            // 也不挂手势（纯展示），滚动性能与改动前一致。
+            if (FavoritesPolicy.isFavorited(m.favoritedAt)) {
+                Box(
+                    Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(7.dp)
+                        .size(20.dp)
+                        .clip(CircleShape)
+                        .background(Color.Black.copy(alpha = 0.55f)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    androidx.compose.material3.Icon(
+                        AppIcons.Star,
+                        contentDescription = "已收藏",
+                        tint = Color.White,
+                        modifier = Modifier.size(12.dp),
+                    )
+                }
             }
 
             // 详情入口：右下角。视觉保持小圆点，外层 48dp 透明热区保证可点。
