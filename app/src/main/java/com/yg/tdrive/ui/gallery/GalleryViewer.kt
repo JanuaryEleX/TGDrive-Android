@@ -114,11 +114,12 @@ fun GalleryViewer(
         if (originalStates[id] is OriginalState.Ready) return
         if (!inFlight.add(id)) return
 
+        diag("orig start id=$id fileId=${m.fileId} size=${m.size} thumb=${m.thumbPath != null}")
         originalStates = originalStates + (id to OriginalState.Loading)
         var ready = false
         var cancelled = false
         try {
-            val file = ensureOriginal(m)
+            val file = ensureOriginal(m) { diag(it) }
             if (file != null) {
                 originalStates = originalStates + (id to OriginalState.Ready(file))
                 ready = true
@@ -129,6 +130,7 @@ fun GalleryViewer(
             throw c
         } catch (t: Throwable) {
             // 网络/TDLib 失败：保持缩略图，交给下面的统一提示
+            diag("orig FAIL id=$id fileId=${m.fileId} size=${m.size} ${t::class.java.simpleName}: ${t.message}")
         } finally {
             inFlight.remove(id)
             if (!ready) {
@@ -433,9 +435,10 @@ private sealed interface OriginalState {
  * LRU 命中或整段可用时 globalOffset 为 0，直接拿整个文件。
  * 返回 null 表示没拿到全量（区间起点非 0 或文件为空），调用方保持缩略图。
  */
-private suspend fun ensureOriginal(m: MediaEntity): java.io.File? {
+private suspend fun ensureOriginal(m: MediaEntity, log: (String) -> Unit): java.io.File? {
     val ref = ServiceLocator.downloadManager.ensureRange(m.fileId, 0L, m.size)
-    if (ref.globalOffset != 0L) return null
     val f = java.io.File(ref.partialPath)
+    log("orig range id=${m.id} fileId=${m.fileId} size=${m.size} gOff=${ref.globalOffset} disk=${f.length()}")
+    if (ref.globalOffset != 0L) return null
     return if (f.isFile && f.length() > 0L) f else null
 }
