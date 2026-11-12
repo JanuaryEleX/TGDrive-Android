@@ -21,9 +21,10 @@ class PosterSizingTest {
 
     @Test
     fun `像素随屏幕密度线性放大`() {
-        val mdpi = PosterSizing.decodePx(400, 3, 1f)
-        val hdpi = PosterSizing.decodePx(400, 3, 2f)
-        assertEquals(mdpi * 2, hdpi)
+        // 用 600dp 宽、2x/4x：算出的像素都落在 [180, 640] 区间内，不会被夹紧干扰。
+        val twoX = PosterSizing.decodePx(600, 3, 2f)
+        val fourX = PosterSizing.decodePx(600, 3, 4f)
+        assertEquals(twoX * 2, fourX)
     }
 
     @Test
