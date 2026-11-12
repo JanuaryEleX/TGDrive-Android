@@ -55,6 +55,7 @@ import com.yg.tgdrive.CrashLogger
 import com.yg.tgdrive.ServiceLocator
 import com.yg.tgdrive.data.ScanDiagnostics
 import com.yg.tgdrive.data.SelectableChat
+import com.yg.tgdrive.ui.common.AppIcons
 import com.yg.tgdrive.ui.common.DriveEntity
 import com.yg.tgdrive.ui.common.ProxyEditor
 import com.yg.tgdrive.ui.common.ProxyMode
@@ -461,6 +462,7 @@ private fun AddDriveDialog(
     var chats by remember { mutableStateOf<List<SelectableChat>>(emptyList()) }
     var picked by remember { mutableStateOf<Set<Long>>(emptySet()) }
     var loadError by remember { mutableStateOf<String?>(null) }
+    var query by remember { mutableStateOf("") }
 
     LaunchedEffect(Unit) {
         try {
@@ -501,36 +503,72 @@ private fun AddDriveDialog(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         style = MaterialTheme.typography.bodyMedium,
                     )
-                    else -> LazyColumn(Modifier.heightIn(max = 320.dp)) {
-                        items(chats, key = { it.chatId }) { chat ->
-                            val already = chat.chatId in existingChatIds
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                modifier = Modifier.fillMaxWidth(),
-                            ) {
-                                Checkbox(
-                                    checked = already || chat.chatId in picked,
-                                    enabled = !already && !saving,
-                                    onCheckedChange = { on ->
-                                        picked = if (on) picked + chat.chatId
-                                        else picked - chat.chatId
-                                    },
+                    else -> {
+                        val filtered = remember(chats, query) {
+                            val q = query.trim()
+                            if (q.isEmpty()) chats
+                            else chats.filter { it.title.contains(q, ignoreCase = true) }
+                        }
+                        OutlinedTextField(
+                            value = query,
+                            onValueChange = { query = it },
+                            singleLine = true,
+                            placeholder = { Text("搜索频道/群组", style = MaterialTheme.typography.bodySmall) },
+                            leadingIcon = {
+                                Icon(
+                                    AppIcons.Search,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(18.dp),
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
-                                Column(Modifier.padding(start = 2.dp)) {
-                                    Text(
-                                        chat.title,
-                                        style = MaterialTheme.typography.bodyMedium,
-                                        color = if (already) {
-                                            MaterialTheme.colorScheme.onSurfaceVariant
-                                        } else {
-                                            MaterialTheme.colorScheme.onSurface
+                            },
+                            trailingIcon = {
+                                if (query.isNotEmpty()) {
+                                    TextButton(onClick = { query = "" }) { Text("清空") }
+                                }
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(bottom = 6.dp),
+                        )
+                        if (filtered.isEmpty()) {
+                            Text(
+                                "没有匹配「$query」的频道/群组",
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                style = MaterialTheme.typography.bodySmall,
+                                modifier = Modifier.padding(vertical = 12.dp),
+                            )
+                        } else LazyColumn(Modifier.heightIn(max = 320.dp)) {
+                            items(filtered, key = { it.chatId }) { chat ->
+                                val already = chat.chatId in existingChatIds
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier.fillMaxWidth(),
+                                ) {
+                                    Checkbox(
+                                        checked = already || chat.chatId in picked,
+                                        enabled = !already && !saving,
+                                        onCheckedChange = { on ->
+                                            picked = if (on) picked + chat.chatId
+                                            else picked - chat.chatId
                                         },
                                     )
-                                    Text(
-                                        if (already) "已添加" else chat.type,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    )
+                                    Column(Modifier.padding(start = 2.dp)) {
+                                        Text(
+                                            chat.title,
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            color = if (already) {
+                                                MaterialTheme.colorScheme.onSurfaceVariant
+                                            } else {
+                                                MaterialTheme.colorScheme.onSurface
+                                            },
+                                        )
+                                        Text(
+                                            if (already) "已添加" else chat.type,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
                                 }
                             }
                         }
