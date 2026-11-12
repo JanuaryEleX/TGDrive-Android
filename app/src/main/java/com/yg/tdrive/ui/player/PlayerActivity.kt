@@ -724,14 +724,13 @@ private fun PlayerScreen(activity: PlayerActivity, player: ExoPlayer) {
     DisposableEffect(Unit) {
         val window = activity.window
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        WindowCompat.setDecorFitsSystemWindows(window, false)
+        // 播放器是独立 Activity：主页的状态栏设置不会继承到这里。
+        // 保持系统状态栏可见，布局由系统处理顶端 inset，避免内容压在状态栏下面。
+        WindowCompat.setDecorFitsSystemWindows(window, true)
         val controller = WindowCompat.getInsetsController(window, view)
-        controller.systemBarsBehavior =
-            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-        controller.hide(WindowInsetsCompat.Type.systemBars())
+        controller.show(WindowInsetsCompat.Type.statusBars())
         onDispose {
             window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-            controller.show(WindowInsetsCompat.Type.systemBars())
         }
     }
 

@@ -669,22 +669,24 @@ class MediaRepository(
         return done
     }
 
-    /** FTS 搜索（SPEC §4.5）：display_name 挂 media_fts；空查询返回空列表。 */
+    /** 文件名搜索：中文和单字走 LIKE 子串查询，拉丁词走 FTS 前缀索引。 */
     suspend fun search(q: String): List<MediaItem> {
         val query = q.trim()
         if (query.isEmpty()) return emptyList()
-        // 每个空白分隔 token 转成 "token"* 前缀查询；内嵌引号剥除防 FTS 语法破坏
-        val ftsQuery = query.split(Regex("\\s+"))
-            .joinToString(" ") { "\"${it.replace("\"", "")}\"*" }
-        return runCatching { mediaDao.search(ftsQuery) }
-            .onFailure { Log.w(TAG, "search failed: $ftsQuery", it) }
-            .getOrDefault(emptyList())
+        return if (SearchQueryPolicy.useLike(query)) {
+            val pattern = SearchQueryPolicy.likePattern(query)
+            runCatching { mediaDao.searchLike(pattern) }
+                .onFailure { Log.w(TAG, "searchLike failed: $pattern", it) }
+                .getOrDefault(emptyList())
+        } else {
+            val ftsQuery = SearchQueryPolicy.ftsQuery(query)
+            runCatching { mediaDao.search(ftsQuery) }
+                .onFailure { Log.w(TAG, "search failed: $ftsQuery", it) }
+                .getOrDefault(emptyList())
+        }
     }
 
-    /**
-     * 全局搜索（跨 video+image，按 display_name FTS）分页。
-     * kind 非空时只返回该类型；空查询返回空列表。
-     */
+    /** 全局分页搜索：中文/单字可匹配文件名的任意位置。 */
     suspend fun searchAll(
         query: String,
         kind: String? = null,
@@ -693,11 +695,17 @@ class MediaRepository(
     ): List<MediaItem> = withContext(Dispatchers.IO) {
         val q = query.trim()
         if (q.isEmpty()) return@withContext emptyList()
-        val ftsQuery = q.split(Regex("\\s+"))
-            .joinToString(" ") { "\"${it.replace("\"", "")}\"*" }
-        runCatching { mediaDao.searchAll(ftsQuery, kind, limit, offset) }
-            .onFailure { Log.w(TAG, "searchAll failed: $ftsQuery", it) }
-            .getOrDefault(emptyList())
+        if (SearchQueryPolicy.useLike(q)) {
+            val pattern = SearchQueryPolicy.likePattern(q)
+            runCatching { mediaDao.searchLikeAll(pattern, kind, limit, offset) }
+                .onFailure { Log.w(TAG, "searchLikeAll failed: $pattern", it) }
+                .getOrDefault(emptyList())
+        } else {
+            val ftsQuery = SearchQueryPolicy.ftsQuery(q)
+            runCatching { mediaDao.searchAll(ftsQuery, kind, limit, offset) }
+                .onFailure { Log.w(TAG, "searchAll failed: $ftsQuery", it) }
+                .getOrDefault(emptyList())
+        }
     }
 
     /**

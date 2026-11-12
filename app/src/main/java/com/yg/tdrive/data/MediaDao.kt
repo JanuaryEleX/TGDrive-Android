@@ -89,6 +89,40 @@ interface MediaDao {
     ): List<MediaEntity>
 
     /**
+     * LIKE 子串搜索（中文、单个字符用）。
+     *
+     * FTS5 的 unicode61 分词把连续汉字当成一个 token，`"视"*` 匹配不到「我的视频」，
+     * 所以中文/单字查询改走这里做真正的子串匹配。pattern 由 SearchQueryPolicy 构造，
+     * 已转义 % 与 _，配合 ESCAPE '\'。
+     */
+    @Query(
+        """
+        SELECT * FROM media
+        WHERE display_name LIKE :pattern ESCAPE '\'
+          AND (:kind IS NULL OR kind = :kind)
+        ORDER BY message_date DESC
+        LIMIT :limit OFFSET :offset
+        """
+    )
+    suspend fun searchLikeAll(
+        pattern: String,
+        kind: String?,
+        limit: Int,
+        offset: Int,
+    ): List<MediaEntity>
+
+    /** 同上，非分页版本（首页搜索用）。 */
+    @Query(
+        """
+        SELECT * FROM media
+        WHERE display_name LIKE :pattern ESCAPE '\'
+        ORDER BY message_date DESC
+        LIMIT 100
+        """
+    )
+    suspend fun searchLike(pattern: String): List<MediaEntity>
+
+    /**
      * 条件筛选 + 排序 + 分页（全局，跨驱动器）。
      * sortBy ∈ {name,date,size,duration}；desc=true 降序。
      * 动态排序用 CASE 表达式实现（Room 不允许直接拼接 ORDER BY 片段）。
