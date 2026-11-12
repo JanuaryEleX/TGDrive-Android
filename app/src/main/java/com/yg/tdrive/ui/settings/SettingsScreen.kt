@@ -817,7 +817,7 @@ private fun ThemeSection() {
             )
             Spacer(Modifier.height(8.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                ThemeChoice("跟随系统", mode == "system", Modifier.weight(1f)) {
+                ThemeChoice("系统", mode == "system", Modifier.weight(1f)) {
                     scope.launch { ServiceLocator.settings.setThemeMode("system") }
                 }
                 ThemeChoice("浅色", mode == "light", Modifier.weight(1f)) {
