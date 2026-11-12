@@ -16,6 +16,7 @@ import androidx.compose.animation.togetherWith
 import androidx.compose.animation.core.tween
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
 import com.yg.tgdrive.ServiceLocator
 import com.yg.tgdrive.td.AuthState
 import com.yg.tgdrive.ui.onboarding.OnboardingFlow
