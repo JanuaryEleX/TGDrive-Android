@@ -113,7 +113,7 @@ fun MainScreen(
                         1 -> "视频"
                         else -> "图片"
                     },
-                    style = MaterialTheme.typography.headlineMedium,
+                    style = MaterialTheme.typography.headlineSmall,
                     color = MaterialTheme.colorScheme.onBackground,
                 )
                 Text(
@@ -189,9 +189,13 @@ fun MainScreen(
             }
         }
 
-        // 扫描进度
+        // 扫描进度：用 AnimatedVisibility 淡出，避免扫描结束瞬间列表整体上跳
         val scan by ServiceLocator.mediaRepository.scanProgress.collectAsState()
-        if (scan.running) {
+        androidx.compose.animation.AnimatedVisibility(
+            visible = scan.running,
+            enter = androidx.compose.animation.fadeIn() + androidx.compose.animation.expandVertically(),
+            exit = androidx.compose.animation.fadeOut() + androidx.compose.animation.shrinkVertically(),
+        ) {
             Column(Modifier.fillMaxWidth().padding(horizontal = 18.dp)) {
                 LinearProgressIndicator(
                     modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(2.dp)),
@@ -332,10 +336,10 @@ private fun RecentGrid(items: LazyPagingItems<MediaEntity>) {
         return
     }
     LazyVerticalGrid(
-        columns = GridCells.Fixed(3),
+        columns = GridCells.Fixed(2),
         contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 16.dp),
-        horizontalArrangement = Arrangement.spacedBy(9.dp),
-        verticalArrangement = Arrangement.spacedBy(14.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        verticalArrangement = Arrangement.spacedBy(18.dp),
         modifier = Modifier.fillMaxSize(),
     ) {
         items(count = items.itemCount, key = items.itemKey { it.id }) { index ->
@@ -582,10 +586,10 @@ private fun WallGrid(items: LazyPagingItems<MediaEntity>, onInfo: (MediaEntity) 
         else -> {
             Column(Modifier.fillMaxSize()) {
                 LazyVerticalGrid(
-                    columns = GridCells.Fixed(3),
+                    columns = GridCells.Fixed(2),
                     contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 16.dp),
-                    horizontalArrangement = Arrangement.spacedBy(9.dp),
-                    verticalArrangement = Arrangement.spacedBy(14.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(18.dp),
                 ) {
                     items(
                         count = items.itemCount,
@@ -618,14 +622,14 @@ private fun WallGrid(items: LazyPagingItems<MediaEntity>, onInfo: (MediaEntity) 
 @Composable
 private fun PosterSkeletonGrid() {
     LazyVerticalGrid(
-        columns = GridCells.Fixed(3),
+        columns = GridCells.Fixed(2),
         contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 16.dp),
-        horizontalArrangement = Arrangement.spacedBy(9.dp),
-        verticalArrangement = Arrangement.spacedBy(14.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        verticalArrangement = Arrangement.spacedBy(18.dp),
         userScrollEnabled = false,
         modifier = Modifier.fillMaxSize(),
     ) {
-        items(12) {
+        items(8) {
             Column {
                 Box(
                     Modifier
@@ -772,45 +776,52 @@ internal fun PosterCell(
             if (dur.isNotEmpty()) {
                 Text(
                     dur,
-                    style = MaterialTheme.typography.labelSmall,
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold,
                     color = Color.White,
                     modifier = Modifier
                         .align(Alignment.BottomStart)
-                        .padding(6.dp)
-                        .clip(RoundedCornerShape(5.dp))
-                        .background(Color.Black.copy(alpha = 0.55f))
-                        .padding(horizontal = 5.dp, vertical = 1.5.dp),
+                        .padding(8.dp)
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(Color.Black.copy(alpha = 0.68f))
+                        .padding(horizontal = 7.dp, vertical = 3.dp),
                 )
             }
 
-            // 详情入口：右下角，仅一个半透明圆点
+            // 详情入口：右下角。视觉保持小圆点，外层 48dp 透明热区保证可点。
             Box(
                 Modifier
                     .align(Alignment.BottomEnd)
-                    .padding(6.dp)
-                    .size(20.dp)
-                    .clip(CircleShape)
-                    .background(Color.Black.copy(alpha = 0.45f))
-                    .pointerInput(m.id) { detectTapGestures { onInfo(m) } },
+                    .size(48.dp),
                 contentAlignment = Alignment.Center,
             ) {
-                androidx.compose.material3.Icon(
-                    AppIcons.More,
-                    contentDescription = "详情",
-                    tint = Color.White.copy(alpha = 0.85f),
-                    modifier = Modifier.size(12.dp),
-                )
+                Box(
+                    Modifier
+                        .size(22.dp)
+                        .clip(CircleShape)
+                        .background(Color.Black.copy(alpha = 0.5f))
+                        .pointerInput(m.id) { detectTapGestures { onInfo(m) } },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    androidx.compose.material3.Icon(
+                        AppIcons.More,
+                        contentDescription = "详情",
+                        tint = Color.White.copy(alpha = 0.9f),
+                        modifier = Modifier.size(13.dp),
+                    )
+                }
             }
         }
 
-        Spacer(Modifier.height(6.dp))
+        Spacer(Modifier.height(7.dp))
         Text(
             m.displayName,
-            style = MaterialTheme.typography.labelMedium,
+            style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.92f),
             maxLines = 2,
+            minLines = 2,
             overflow = TextOverflow.Ellipsis,
-            lineHeight = 14.5.sp,
+            lineHeight = 16.sp,
             modifier = Modifier.padding(horizontal = 1.dp),
         )
     }
