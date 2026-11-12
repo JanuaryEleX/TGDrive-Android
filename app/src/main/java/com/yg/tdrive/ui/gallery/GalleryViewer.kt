@@ -108,6 +108,14 @@ fun GalleryViewer(
      * 注意：这里**不能**用 runCatching 包 ensureOriginal —— 它会把 CancellationException
      * 一并吞成 null，滑动取消就被误判成「加载失败」而弹 Toast。
      */
+    /** 看图页诊断：只记 id/序号/异常文本，不记文件名与画面。用于定位打开错图与原图失败。 */
+    fun diag(line: String) {
+        runCatching {
+            java.io.File(context.filesDir, "viewer-diag.txt")
+                .appendText("${System.currentTimeMillis()} $line\n")
+        }
+    }
+
     suspend fun loadOriginal(m: MediaEntity) {
         val id = m.id
         if (id <= 0L) return
@@ -147,13 +155,6 @@ fun GalleryViewer(
     }
 
     /** 看图页诊断：只记 id/序号，不记文件名与画面。用于定位「点开 A 显示 B」。 */
-    fun diag(line: String) {
-        runCatching {
-            java.io.File(context.filesDir, "viewer-diag.txt")
-                .appendText("${System.currentTimeMillis()} $line\n")
-        }
-    }
-
     // 载入相册内容（图片序列 + 视频列表）
     LaunchedEffect(initial.id) {
         val album = initial.mediaAlbumId ?: 0L
