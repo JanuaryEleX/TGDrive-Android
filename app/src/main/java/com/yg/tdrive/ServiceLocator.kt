@@ -35,7 +35,7 @@ import kotlinx.coroutines.launch
  *   com.yg.tgdrive.td.TdProxyManager(td: TdClient)
  *
  * settings（已存在，已按实际文件核对）:
- *   com.yg.tgdrive.settings.SettingsStore(context: Context)   — concurrency: Flow<Int>（1..8 默认 4）
+ *   com.yg.tgdrive.settings.SettingsStore(context: Context)   — concurrency: Flow<Int>（1..16 默认 4）
  *   com.yg.tgdrive.settings.CredentialsStore(context: Context)
  *
  * data 包（数据层 agent 并行在写，按 SPEC §5/§6 假设）:
@@ -145,7 +145,7 @@ object ServiceLocator {
             playbackProgressDao = appDatabase.playbackProgressDao()
             favoritesRepository = FavoritesRepository(appDatabase)
 
-            // 下载层：并发 Flow 由 manager 内部 collect 实现 1~8 滑杆热更（SPEC §4.3 Q28）
+            // 下载层：流播只采样并发偏好用于诊断，离线下载管理器实际热更 1~16 路
             downloadManager = StreamingDownloadManager(
                 td = tdClient,
                 concurrency = settings.concurrency,

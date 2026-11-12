@@ -65,7 +65,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
- * 设置页（SPEC §4.5）：驱动器管理（列表+删除+手动重扫）· 并发滑杆 1~8 ·
+ * 设置页（SPEC §4.5）：驱动器管理（列表+删除+手动重扫）· 并发滑杆 1~16 ·
  * 缓存上限滑杆 1~64GB + 清空缓存 · 代理修改（复用 ProxyEditor）· 退出登录 · 关于。
  */
 @OptIn(ExperimentalMaterial3Api::class)
@@ -148,7 +148,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                 Column(Modifier.padding(16.dp)) {
                     Text("下载并发数：${concurrencyDraft.toInt()}", style = MaterialTheme.typography.titleMedium)
                     Text(
-                        "1~8 路，实时生效；数值越大下载/流播越快，也可能更容易触发服务端限速。",
+                        "1~16 路离线下载，应用后实时生效；数值越大越可能触发服务端限速。流播不受此项控制。",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -156,8 +156,8 @@ fun SettingsScreen(onBack: () -> Unit) {
                     Slider(
                         value = concurrencyDraft,
                         onValueChange = { concurrencyDraft = it },
-                        valueRange = 1f..8f,
-                        steps = 6,
+                        valueRange = 1f..16f,
+                        steps = 14,
                     )
                     Spacer(Modifier.height(8.dp))
                     Button(

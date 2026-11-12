@@ -45,12 +45,12 @@ class SettingsStore(private val context: Context) {
     val onboarded: Flow<Boolean> = context.dataStore.data.map { it[K.onboarded] ?: false }
     suspend fun setOnboarded(v: Boolean) = context.dataStore.edit { it[K.onboarded] = v }
 
-    /** 并发 1~8，默认 4（Q28）。 */
+    /** 离线下载并发 1~16，默认 4。 */
     val concurrency: Flow<Int> = context.dataStore.data.map {
-        (it[K.concurrency] ?: 4).coerceIn(1, 8)
+        (it[K.concurrency] ?: 4).coerceIn(1, 16)
     }
     suspend fun setConcurrency(v: Int) =
-        context.dataStore.edit { it[K.concurrency] = v.coerceIn(1, 8) }
+        context.dataStore.edit { it[K.concurrency] = v.coerceIn(1, 16) }
 
     /** LRU 缓存上限 GB，1~64，默认 4（Q24 可调滑杆）。 */
     val cacheCapGb: Flow<Int> = context.dataStore.data.map {

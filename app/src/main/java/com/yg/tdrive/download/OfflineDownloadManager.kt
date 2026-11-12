@@ -108,7 +108,7 @@ class OfflineDownloadManager(
         // 并发上限热更
         scope.launch {
             settings.concurrency.collect { n ->
-                maxConcurrent = n.coerceIn(1, 8)
+                maxConcurrent = n.coerceIn(1, 16)
                 pump()
             }
         }

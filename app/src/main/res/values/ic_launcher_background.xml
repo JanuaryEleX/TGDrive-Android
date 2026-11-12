@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- TG 品牌蓝（SPEC 资源要求） -->
-    <color name="ic_launcher_background">#2AABEE</color>
+    <!-- 深海蓝衬底，提高白色云盘与纸飞机的识别度。 -->
+    <color name="ic_launcher_background">#1765A2</color>
 </resources>
