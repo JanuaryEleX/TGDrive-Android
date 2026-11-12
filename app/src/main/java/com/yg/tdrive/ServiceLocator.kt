@@ -177,17 +177,40 @@ object ServiceLocator {
      */
     fun scheduleAlbumBackfill(app: Context) {
         val prefs = app.getSharedPreferences("maintenance", Context.MODE_PRIVATE)
-        if (prefs.getBoolean(KEY_ALBUM_BACKFILL_DONE, false)) return
+        if (prefs.getBoolean(KEY_ALBUM_BACKFILL_DONE, false)) {
+            scheduleCaptionRename(app, prefs)
+            return
+        }
         appScope.launch {
             val n = runCatching { mediaRepository.backfillAlbumIds() }.getOrNull()
             if (n != null) {
                 prefs.edit().putBoolean(KEY_ALBUM_BACKFILL_DONE, true).apply()
                 Log.i("ServiceLocator", "相册ID回填完成: $n 行")
+                scheduleCaptionRename(app, prefs)
             } else {
                 Log.w("ServiceLocator", "相册ID回填失败（下次启动重试）")
             }
         }
     }
+
+    /**
+     * 按组内文字描述重命名历史视频，仅跑一次。
+     * 新包扫描只对新入库行生效，老行必须单独回填一次（见 MediaRepository.backfillAlbumCaptions）。
+     */
+    private fun scheduleCaptionRename(app: Context, prefs: android.content.SharedPreferences) {
+        if (prefs.getBoolean(KEY_CAPTION_RENAME_DONE, false)) return
+        appScope.launch {
+            val n = runCatching { mediaRepository.backfillAlbumCaptions() }.getOrNull()
+            if (n != null) {
+                prefs.edit().putBoolean(KEY_CAPTION_RENAME_DONE, true).apply()
+                Log.i("ServiceLocator", "描述改名回填完成: $n 行")
+            } else {
+                Log.w("ServiceLocator", "描述改名回填失败（下次启动重试）")
+            }
+        }
+    }
+
+    private const val KEY_CAPTION_RENAME_DONE = "album_caption_rename_v3"
 
     private const val KEY_ALBUM_BACKFILL_DONE = "album_backfill_done_v2"
 

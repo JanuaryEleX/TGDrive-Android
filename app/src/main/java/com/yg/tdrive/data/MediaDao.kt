@@ -209,6 +209,18 @@ interface MediaDao {
     )
     suspend fun deleteByMessage(chatId: Long, messageIds: List<Long>)
 
+    /** 同组视频已有的描述名：供跨页扫描继承；忽略原始文件名。 */
+    @Query("""SELECT display_name FROM media
+        WHERE drive_id = :driveId AND media_album_id = :albumId AND kind = 'video'
+          AND original_name != '' AND display_name != original_name LIMIT 1""")
+    suspend fun albumVideoCaption(driveId: Long, albumId: Long): String?
+
+    /** 同组视频可改名的行：只匹配 display_name == original_name，保护用户手动重命名。 */
+    @Query("""UPDATE media SET display_name = :caption
+        WHERE drive_id = :driveId AND media_album_id = :albumId AND kind = 'video'
+          AND display_name = original_name AND display_name != :caption""")
+    suspend fun applyAlbumCaption(driveId: Long, albumId: Long, caption: String): Int
+
     /** Q17：重命名只覆盖本地显示名，FTS 由触发器自动同步。 */
     @Query("UPDATE media SET display_name = :newName WHERE id = :id")
     suspend fun updateDisplayName(id: Long, newName: String)

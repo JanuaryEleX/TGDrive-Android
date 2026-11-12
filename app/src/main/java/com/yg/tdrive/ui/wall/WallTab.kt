@@ -50,7 +50,9 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -353,6 +355,7 @@ private fun RecentGrid(items: LazyPagingItems<MediaEntity>) {
             val m = items[index] ?: return@items
             PosterCell(
                 m,
+                columns = 2,
                 onPlay = { target ->
                     val n = items.itemCount.coerceAtMost(400)
                     val ids = ArrayList<Long>(n)
@@ -436,13 +439,6 @@ private fun ContinueCard(m: MediaEntity, onClick: () -> Unit) {
         )
     }
 }
-
-/**
- * 海报解码尺寸（像素）。
- * 三列布局、卡片约 120dp 宽 → 按最高 3x 密度算 360px，取 400 留余量。
- * 固定像素值让 Coil 的内存缓存键稳定，避免同图不同尺寸重复解码。
- */
-private val POSTER_DECODE_PX = 400
 
 /** 继续观看卡片：176dp 宽 16:9 → 3x 下约 528px，取 560。 */
 private val CONTINUE_DECODE_PX = 560
@@ -647,6 +643,7 @@ private fun WallGrid(
                         val m = items[index] ?: return@items
                         PosterCell(
                             m,
+                            columns = columns,
                             onPlay = { target ->
                                 val n = items.itemCount.coerceAtMost(400)
                                 val ids = ArrayList<Long>(n)
@@ -773,14 +770,15 @@ private fun ContinueWatchingRow() {
 @Composable
 internal fun PosterCell(
     m: MediaEntity,
+    columns: Int = 2,
     onPlay: (MediaEntity) -> Unit,
     onInfo: (MediaEntity) -> Unit,
 ) {
     // 手势只挂在图片区（Box）上，不包整个 Column：
     // 整卡手势会让标题文字区也参与命中测试，滚动时每帧多一次布局遍历。
-    Column(
-        modifier = Modifier.clip(RoundedCornerShape(11.dp)),
-    ) {
+    // 外层不再 clip：图片 Box 自己已经圆角裁剪，多一层 clip 等于每格多一个离屏图层，
+    // 三列时一屏几十个图层，是实测掉帧的主要来源之一。
+    Column {
         Box(
             Modifier
                 .fillMaxWidth()
@@ -794,14 +792,24 @@ internal fun PosterCell(
                     )
                 },
         ) {
-            // 必须指定解码尺寸：三列海报每格约 120dp，不指定时 Coil 按原图分辨率
-            // 解码（缩略图常 1000px+），滚动时大量 Bitmap 分配 + GC 抖动 → 掉帧。
-            AsyncImage(
-                model = ImageRequest.Builder(LocalContext.current)
+            // 解码尺寸按列数/屏幕宽度实时算：三列每格更小，按原图或固定 400px 解码
+            // 会让 UI 线程在滚动时忙于 Bitmap 分配（实测三列中位帧耗时 44ms）。
+            val density = LocalDensity.current.density
+            val screenWidthDp = LocalConfiguration.current.screenWidthDp
+            val posterPx = remember(columns, screenWidthDp, density) {
+                PosterSizing.decodePx(screenWidthDp, columns, density)
+            }
+            // ImageRequest 必须在 composition 外构建一次：每次重组 new 一个 Builder
+            // 会让 Coil 认为请求变了，反复重建、丢弃缓存键。
+            val posterModel = remember(m.thumbPath, posterPx) {
+                ImageRequest.Builder(LocalContext.current)
                     .data(m.thumbPath?.let { java.io.File(it) })
-                    .size(POSTER_DECODE_PX)
+                    .size(posterPx)
                     .crossfade(false)
-                    .build(),
+                    .build()
+            }
+            AsyncImage(
+                model = posterModel,
                 contentDescription = m.displayName,
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.fillMaxSize(),

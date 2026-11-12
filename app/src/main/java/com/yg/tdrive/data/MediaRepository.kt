@@ -423,15 +423,30 @@ class MediaRepository(
                 if (!cap.isNullOrBlank()) put(albumId, cap)
             }
         }
+        // 相册描述可能只在相邻扫描页的一张图片上；先从本地已入库行继承，
+        // 再用本页真实 caption 覆盖。不要把显示名当 original_name 改写。
+        val albumIds = parsedRaw.mapNotNull { it.first.mediaAlbumId }.distinct()
+        val knownCaptions = albumIds.mapNotNull { id ->
+            mediaDao.albumVideoCaption(driveId, id)?.let { id to it }
+        }.toMap()
+        val resolvedCaptions = knownCaptions + albumCaptions
         val parsed = parsedRaw.map { pair ->
             val entity = pair.first
             if (entity.kind != MediaKind.VIDEO) return@map pair
-            val cap = entity.mediaAlbumId?.let { albumCaptions[it] } ?: return@map pair
-            pair.copy(first = entity.copy(displayName = cap, originalName = cap))
+            val cap = entity.mediaAlbumId?.let { resolvedCaptions[it] } ?: return@map pair
+            pair.copy(first = entity.copy(displayName = cap))
         }
-        if (parsed.isEmpty()) return PageIngest(0, emptyMap())
+        if (parsed.isEmpty()) {
+            albumCaptions.forEach { (albumId, caption) ->
+                mediaDao.applyAlbumCaption(driveId, albumId, caption)
+            }
+            return PageIngest(0, emptyMap())
+        }
         val entities = parsed.map { it.first }
         val rowIds = withContext(Dispatchers.IO) { mediaDao.insertAllIgnoring(entities) }
+        albumCaptions.forEach { (albumId, caption) ->
+            mediaDao.applyAlbumCaption(driveId, albumId, caption)
+        }
         val thumbs = HashMap<Long, JsonObject>()
         parsed.forEachIndexed { i, (entity, thumb) ->
             if (thumb != null) thumbs[entity.messageId] = thumb
@@ -644,6 +659,16 @@ class MediaRepository(
                         onProgress(done, total)
                     }
                 }
+                // 同一历史页里图片的 caption 也要用于已经存在的视频。
+                val captions = messages.mapNotNull { msg ->
+                    val id = msg["media_album_id"]?.jsonPrimitive?.longOrNull
+                        ?.takeIf { it != 0L } ?: return@mapNotNull null
+                    val text = captionOf(msg)?.let(::sanitizeCaption).orEmpty()
+                    if (text.isBlank()) null else id to text
+                }.toMap()
+                captions.forEach { (id, caption) ->
+                    mediaDao.applyAlbumCaption(driveId, id, caption)
+                }
                 val lastId = messages.last()["id"]?.jsonPrimitive?.longOrNull ?: break
                 if (lastId == 0L) break
                 if (messages.size < SCAN_PAGE_SIZE) {
@@ -667,6 +692,84 @@ class MediaRepository(
         val left = runCatching { mediaDao.countMissingAlbum() }.getOrDefault(-1)
         Log.i(TAG, "相册回填完成: 实际填充=$done 总缺=$total 剩余缺=$left")
         return done
+    }
+
+    /**
+     * 按组内文字描述重命名历史视频（老数据回填）。
+     *
+     * 为什么必须单独回填：旧包入库时没有写描述名，而 `insertAllIgnoring` 不会更新已存在行，
+     * 所以即便新包扫描同一页也无法修正老行 —— 必须重新走一遍历史页，把同组描述批量应用。
+     * 只改 `display_name == original_name` 的行，用户手动改过的名字不动。
+     *
+     * @return 实际改名的行数。
+     */
+    suspend fun backfillAlbumCaptions(
+        onProgress: (pages: Int, renamed: Int) -> Unit = { _, _ -> },
+    ): Int {
+        var renamed = 0
+        var pages = 0
+        val drives = withContext(Dispatchers.IO) { driveDao.getAll() }
+        for (drive in drives) {
+            var fromMessageId = 0L
+            var emptyRetries = 0
+            var shortRetries = 0
+            while (true) {
+                val resp = runCatching {
+                    callWithFloodRetry(
+                        tdObj(
+                            "@type" to "getChatHistory",
+                            "chat_id" to drive.chatId,
+                            "from_message_id" to fromMessageId,
+                            "offset" to 0,
+                            "limit" to SCAN_PAGE_SIZE,
+                            "only_local" to false,
+                        )
+                    )
+                }.getOrNull() ?: break
+                val messages = resp["messages"]?.jsonArray
+                    ?.mapNotNull { it as? JsonObject } ?: emptyList()
+                if (messages.isEmpty()) {
+                    if (emptyRetries < EMPTY_PAGE_RETRIES) {
+                        emptyRetries++
+                        delay(EMPTY_PAGE_DELAY_MS)
+                        continue
+                    }
+                    break
+                }
+                emptyRetries = 0
+                // 同一相册的描述可能挂在图片上，视频自己为空 —— 整页先聚合成
+                // albumId -> caption，再一次性批量改写该组所有视频。
+                val captions = messages.mapNotNull { msg ->
+                    val id = msg["media_album_id"]?.jsonPrimitive?.longOrNull
+                        ?.takeIf { it != 0L } ?: return@mapNotNull null
+                    val text = captionOf(msg)?.let(::sanitizeCaption).orEmpty()
+                    if (text.isBlank()) null else id to text
+                }.toMap()
+                if (captions.isNotEmpty()) {
+                    for ((albumId, caption) in captions) {
+                        val n = withContext(Dispatchers.IO) {
+                            mediaDao.applyAlbumCaption(drive.id, albumId, caption)
+                        }
+                        renamed += n
+                    }
+                }
+                pages++
+                onProgress(pages, renamed)
+                val lastId = messages.last()["id"]?.jsonPrimitive?.longOrNull ?: break
+                if (lastId == 0L) break
+                if (messages.size < SCAN_PAGE_SIZE) {
+                    shortRetries++
+                    if (shortRetries > BACKFILL_SHORT_PAGE_RETRIES) break
+                    delay(SHORT_PAGE_DELAY_MS)
+                    continue
+                }
+                shortRetries = 0
+                fromMessageId = lastId
+                delay(PAGE_DELAY_MS)
+            }
+        }
+        Log.i(TAG, "描述改名回填完成: 页数=$pages 改名行数=$renamed")
+        return renamed
     }
 
     /** 文件名搜索：中文和单字走 LIKE 子串查询，拉丁词走 FTS 前缀索引。 */
