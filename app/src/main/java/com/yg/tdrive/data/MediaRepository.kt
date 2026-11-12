@@ -821,6 +821,11 @@ class MediaRepository(
         }
     }
 
+    /** 从本地索引标题生成词云。 */
+    suspend fun keywordCloud(): List<KeywordCloud.Word> = withContext(Dispatchers.IO) {
+        KeywordCloud.fromNames(mediaDao.recentDisplayNames(3000))
+    }
+
     /** 全局分页搜索：中文/单字可匹配文件名的任意位置。 */
     suspend fun searchAll(
         query: String,

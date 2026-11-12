@@ -122,6 +122,10 @@ interface MediaDao {
     )
     suspend fun searchLike(pattern: String): List<MediaEntity>
 
+    /** 词云只读取本地索引的标题文本，避免一次加载整表的媒体/缩略图字段。 */
+    @Query("SELECT display_name FROM media ORDER BY message_date DESC LIMIT :limit")
+    suspend fun recentDisplayNames(limit: Int): List<String>
+
     /**
      * 条件筛选 + 排序 + 分页（全局，跨驱动器）。
      * sortBy ∈ {name,date,size,duration}；desc=true 降序。
