@@ -1,6 +1,15 @@
 package com.yg.tgdrive.ui.wall
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.togetherWith
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
@@ -67,6 +76,7 @@ import androidx.paging.compose.itemKey
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import com.yg.tgdrive.ServiceLocator
+import com.yg.tgdrive.data.BottomBarPolicy
 import com.yg.tgdrive.data.FavoritesPolicy
 import com.yg.tgdrive.data.MediaKind
 import com.yg.tgdrive.td.AuthState
@@ -92,6 +102,7 @@ import kotlinx.coroutines.launch
  * 深色近黑底、单一强调色、海报本身承载全部信息，不再在图上叠一排黑底小方块。
  * authState != Ready 时全屏锁定。
  */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun MainScreen(
     onOpenSettings: () -> Unit,
@@ -100,6 +111,8 @@ fun MainScreen(
 ) {
     val authState by ServiceLocator.tdClient.authState.collectAsState()
     // tab 序号：0=最近 1=收藏 2=视频 3=图片。默认仍落在视频（海报墙），保持老用户手感。
+    /** 长按底栏后打开该栏筛选；无筛选的最近/收藏保持普通切换。 */
+    var filterRequest by remember { mutableStateOf<Int?>(null) }
     var tab by remember { mutableStateOf(2) }
 
     Column(
@@ -228,11 +241,27 @@ fun MainScreen(
         }
 
         Box(Modifier.weight(1f)) {
-            when (tab) {
-                0 -> RecentTab()
-                1 -> FavoritesTab()
-                2 -> WallTab()
-                else -> GalleryTab()
+            AnimatedContent(
+                targetState = tab,
+                transitionSpec = {
+                    val direction = if (targetState > initialState) 1 else -1
+                    (fadeIn(tween(220)) + slideInHorizontally(tween(220)) { it * direction / 7 }) togetherWith
+                        (fadeOut(tween(180)) + slideOutHorizontally(tween(180)) { -it * direction / 7 })
+                },
+                label = "底栏页面切换",
+            ) { selectedTab ->
+                when (selectedTab) {
+                    BottomBarPolicy.RECENT -> RecentTab()
+                    BottomBarPolicy.FAVORITES -> FavoritesTab()
+                    BottomBarPolicy.VIDEOS -> WallTab(
+                        openFilterRequest = filterRequest == BottomBarPolicy.VIDEOS,
+                        onFilterOpened = { filterRequest = null },
+                    )
+                    else -> GalleryTab(
+                        openFilterRequest = filterRequest == BottomBarPolicy.IMAGES,
+                        onFilterOpened = { filterRequest = null },
+                    )
+                }
             }
         }
 
@@ -256,7 +285,14 @@ fun MainScreen(
                     modifier = Modifier
                         .weight(1f)
                         .fillMaxHeight()
-                        .clickable { tab = index },
+                        .combinedClickable(
+                            onClick = { tab = index },
+                            onLongClick = {
+                                tab = index
+                                if (BottomBarPolicy.supportsFilter(index)) filterRequest = index
+                            },
+                            onLongClickLabel = if (BottomBarPolicy.supportsFilter(index)) "打开${label}筛选" else null,
+                        ),
                     contentAlignment = Alignment.Center,
                 ) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -522,7 +558,7 @@ private val CONTINUE_DECODE_PX = 560
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun WallTab() {
+fun WallTab(openFilterRequest: Boolean = false, onFilterOpened: () -> Unit = {}) {
     val drives by ServiceLocator.driveManager.observeDrives().collectAsState(initial = emptyList())
     var selectedDrive by remember { mutableStateOf<Long?>(null) }
     var detailFor by remember { mutableStateOf<MediaEntity?>(null) }
@@ -531,6 +567,12 @@ fun WallTab() {
     var showFilter by remember { mutableStateOf(false) }
     // 海报墙列数偏好（2/3 列可切换，持久化在 DataStore）
     val wallColumns by ServiceLocator.settings.wallColumns.collectAsState(initial = 2)
+    LaunchedEffect(openFilterRequest) {
+        if (openFilterRequest) {
+            showFilter = true
+            onFilterOpened()
+        }
+    }
 
     if (showFilter) {
         FilterSheet(
@@ -568,24 +610,6 @@ fun WallTab() {
 
 
     Column(Modifier.fillMaxSize()) {
-        Row(
-            Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 4.dp),
-            horizontalArrangement = Arrangement.End,
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            // 布局切换：2 列 ⇄ 3 列（偏好持久化，切换后 Paging 与 Coil 缓存复用）
-            LayoutToggleButton(
-                columns = wallColumns,
-                onToggle = {
-                    ServiceLocator.appScope.launch {
-                        ServiceLocator.settings.setWallColumns(if (wallColumns >= 3) 2 else 3)
-                    }
-                },
-            )
-            Spacer(Modifier.size(8.dp))
-            FilterButton(active = filter.isActive(), onClick = { showFilter = true })
-        }
-
         if (drives.size > 1) {
             LazyRow(
                 contentPadding = PaddingValues(horizontal = 18.dp),
@@ -622,32 +646,6 @@ fun WallTab() {
 
     if (detailFor != null) {
         MediaDetailSheet(media = detailFor!!, onDismiss = { detailFor = null })
-    }
-}
-
-/** 布局切换按钮：2 列 ⇄ 3 列。 */
-@Composable
-private fun LayoutToggleButton(columns: Int, onToggle: () -> Unit) {
-    Row(
-        modifier = Modifier
-            .clip(RoundedCornerShape(50))
-            .background(MaterialTheme.colorScheme.surfaceContainerHigh)
-            .clickable(onClick = onToggle)
-            .padding(horizontal = 12.dp, vertical = 7.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        androidx.compose.material3.Icon(
-            if (columns >= 3) AppIcons.GridThree else AppIcons.GridTwo,
-            contentDescription = if (columns >= 3) "切换到两列" else "切换到三列",
-            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.size(16.dp),
-        )
-        Spacer(Modifier.width(5.dp))
-        Text(
-            if (columns >= 3) "三列" else "两列",
-            style = MaterialTheme.typography.labelMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
     }
 }
 

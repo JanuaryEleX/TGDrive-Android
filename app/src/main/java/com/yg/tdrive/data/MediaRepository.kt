@@ -848,6 +848,31 @@ class MediaRepository(
         }
     }
 
+    /** 搜索词与筛选条件同时生效（在数据库中先过滤后分页）。 */
+    suspend fun searchFiltered(
+        query: String,
+        kind: String? = null,
+        minSize: Long? = null,
+        maxSize: Long? = null,
+        minDurationMs: Long? = null,
+        maxDurationMs: Long? = null,
+        dateFrom: Long? = null,
+        dateTo: Long? = null,
+        sortBy: String = "date",
+        desc: Boolean = true,
+        limit: Int = 60,
+        offset: Int = 0,
+    ): List<MediaItem> = withContext(Dispatchers.IO) {
+        val pattern = SearchQueryPolicy.likePattern(query.trim())
+        runCatching {
+            mediaDao.searchFiltered(
+                pattern, kind, minSize, maxSize, minDurationMs, maxDurationMs,
+                dateFrom, dateTo, sortBy, desc, limit, offset,
+            )
+        }.onFailure { Log.w(TAG, "searchFiltered failed", it) }
+            .getOrDefault(emptyList())
+    }
+
     /**
      * 条件筛选 + 排序 + 分页（全局）。dateFrom/dateTo 单位为 epoch 秒。
      * sortBy ∈ name|date|size|duration。

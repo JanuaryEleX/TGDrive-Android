@@ -3,6 +3,12 @@ package com.yg.tgdrive.ui.search
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.ExperimentalLayoutApi
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.ui.focus.LocalFocusManager
+import androidx.compose.ui.unit.sp
+import com.yg.tgdrive.data.KeywordCloud
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -44,6 +50,8 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.yg.tgdrive.ServiceLocator
@@ -73,6 +81,10 @@ fun SearchScreen(onBack: () -> Unit) {
 
     val repo = ServiceLocator.mediaRepository
     val context = LocalContext.current
+    val focusManager = LocalFocusManager.current
+    val keyboard = LocalSoftwareKeyboardController.current
+    var cloud by remember { mutableStateOf<List<KeywordCloud.Word>>(emptyList()) }
+    LaunchedEffect(Unit) { cloud = runCatching { repo.keywordCloud() }.getOrDefault(emptyList()) }
 
     var query by remember { mutableStateOf("") }
     var filter by remember { mutableStateOf(FilterState()) }
@@ -102,6 +114,16 @@ fun SearchScreen(onBack: () -> Unit) {
             q.isNotEmpty() && !active ->
                 repo.searchAll(query = q, kind = null, limit = PAGE_SIZE, offset = off)
 
+            active && q.isNotEmpty() ->
+                repo.searchFiltered(
+                    query = q, kind = filter.kind,
+                    minSize = filter.minSizeBytes, maxSize = filter.maxSizeBytes,
+                    minDurationMs = filter.minDurationMs, maxDurationMs = filter.maxDurationMs,
+                    dateFrom = filter.dateFromSec, dateTo = filter.dateToSec,
+                    sortBy = filter.sortBy, desc = filter.desc,
+                    limit = PAGE_SIZE, offset = off,
+                )
+
             active ->
                 repo.filtered(
                     kind = filter.kind,
@@ -115,10 +137,7 @@ fun SearchScreen(onBack: () -> Unit) {
                     desc = filter.desc,
                     limit = PAGE_SIZE,
                     offset = off,
-                ).let { list ->
-                    // 筛选模式下若还带关键词，则在页内按文件名过滤
-                    if (q.isEmpty()) list else list.filter { it.displayName.contains(q, ignoreCase = true) }
-                }
+                )
 
             else -> emptyList()
         }
@@ -234,6 +253,8 @@ fun SearchScreen(onBack: () -> Unit) {
                         value = query,
                         onValueChange = { query = it },
                         singleLine = true,
+                        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(imeAction = ImeAction.Search),
+                        keyboardActions = KeyboardActions(onSearch = { keyboard?.hide(); focusManager.clearFocus() }),
                         textStyle = MaterialTheme.typography.bodyMedium.copy(
                             color = MaterialTheme.colorScheme.onSurface,
                         ),
@@ -269,10 +290,18 @@ fun SearchScreen(onBack: () -> Unit) {
         Box(Modifier.weight(1f)) {
             when {
                 !hasSearched && results.isEmpty() && !loading -> {
-                    HintState(
-                        title = "输入关键词开始搜索",
-                        subtitle = "支持按视频/图片文件名搜索，可用右上角「筛选」进一步过滤",
-                    )
+                    if (cloud.isNotEmpty()) {
+                        KeywordCloudPanel(cloud) { word ->
+                            query = word
+                            keyboard?.hide()
+                            focusManager.clearFocus()
+                        }
+                    } else {
+                        HintState(
+                            title = "输入关键词开始搜索",
+                            subtitle = "本地索引中的文件名会生成可点击的常用词",
+                        )
+                    }
                 }
 
                 loading && results.isEmpty() -> {
@@ -344,6 +373,34 @@ fun SearchScreen(onBack: () -> Unit) {
 
     detailFor?.let { m ->
         MediaDetailSheet(media = m, onDismiss = { detailFor = null })
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun KeywordCloudPanel(words: List<KeywordCloud.Word>, onSelect: (String) -> Unit) {
+    Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 22.dp)) {
+        Text("从文件名发现", style = MaterialTheme.typography.titleMedium)
+        Spacer(Modifier.height(6.dp))
+        Text("点击关键词筛选本地视频与图片", style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Spacer(Modifier.height(20.dp))
+        val maxCount = words.maxOfOrNull { it.count }?.coerceAtLeast(1) ?: 1
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(9.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            words.forEach { word ->
+                val prominence = word.count.toFloat() / maxCount
+                Text(
+                    word.text,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(18.dp))
+                        .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.07f + prominence * 0.12f))
+                        .clickable { onSelect(word.text) }
+                        .padding(horizontal = 13.dp, vertical = 9.dp),
+                    fontSize = (13f + 6f * prominence).sp,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
+        }
     }
 }
 

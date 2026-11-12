@@ -79,6 +79,7 @@ fun SettingsScreen(onBack: () -> Unit) {
     val cacheCapFlow = ServiceLocator.settings.cacheCapGb
     val concurrency by concurrencyFlow.collectAsState(initial = 4)
     val cacheCapGb by cacheCapFlow.collectAsState(initial = 4)
+    val wallColumns by ServiceLocator.settings.wallColumns.collectAsState(initial = 2)
     var concurrencyDraft by remember(concurrency) { mutableStateOf(concurrency.toFloat()) }
     var cacheDraft by remember(cacheCapGb) { mutableStateOf(cacheCapGb.toFloat()) }
 
@@ -118,6 +119,27 @@ fun SettingsScreen(onBack: () -> Unit) {
         ) {
             // ---------- 主题 ----------
             ThemeSection()
+
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp)) {
+                    Text("海报墙列数", style = MaterialTheme.typography.titleMedium)
+                    Text("选择视频页每行海报数量，实时生效", style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Spacer(Modifier.height(10.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        listOf(2, 3).forEach { count ->
+                            if (wallColumns == count) {
+                                Button(onClick = {}, modifier = Modifier.weight(1f)) { Text("${count} 列") }
+                            } else {
+                                OutlinedButton(
+                                    onClick = { scope.launch { ServiceLocator.settings.setWallColumns(count) } },
+                                    modifier = Modifier.weight(1f),
+                                ) { Text("${count} 列") }
+                            }
+                        }
+                    }
+                }
+            }
 
             DriveSection()
 

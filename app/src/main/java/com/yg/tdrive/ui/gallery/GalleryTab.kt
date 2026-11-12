@@ -68,7 +68,7 @@ import kotlinx.coroutines.flow.flowOf
  * 与海报墙同一套视觉语言：深色底、圆角、无描边 chip、图内只留一行小字。
  */
 @Composable
-fun GalleryTab() {
+fun GalleryTab(openFilterRequest: Boolean = false, onFilterOpened: () -> Unit = {}) {
     val drives by ServiceLocator.driveManager.observeDrives().collectAsState(initial = emptyList())
     var selectedDrive by remember { mutableStateOf<Long?>(null) }
     var detailFor by remember { mutableStateOf<MediaEntity?>(null) }
@@ -78,6 +78,12 @@ fun GalleryTab() {
     var albumVideo by remember { mutableStateOf<Map<Long, Long?>>(emptyMap()) }
     var filter by remember { mutableStateOf(FilterState()) }
     var showFilter by remember { mutableStateOf(false) }
+    LaunchedEffect(openFilterRequest) {
+        if (openFilterRequest) {
+            showFilter = true
+            onFilterOpened()
+        }
+    }
 
     if (showFilter) {
         FilterSheet(
@@ -134,13 +140,6 @@ fun GalleryTab() {
 
     Box(Modifier.fillMaxSize()) {
     Column(Modifier.fillMaxSize()) {
-        Row(
-            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
-            horizontalArrangement = Arrangement.End,
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            FilterButton(active = filter.isActive(), onClick = { showFilter = true })
-        }
         if (drives.size > 1) {
             LazyRow(
                 contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp),

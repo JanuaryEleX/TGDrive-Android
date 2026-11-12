@@ -8,8 +8,14 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.togetherWith
+import androidx.compose.animation.core.tween
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Modifier
 import com.yg.tgdrive.ServiceLocator
 import com.yg.tgdrive.td.AuthState
 import com.yg.tgdrive.ui.onboarding.OnboardingFlow
@@ -33,7 +39,17 @@ fun AppRoot() {
         route = if (onboarded) Routes.HOME else Routes.ONBOARDING
     }
 
-    when (val r = route) {
+    AnimatedContent(
+        targetState = route,
+        transitionSpec = {
+            val forward = (targetState == Routes.HOME) || (initialState == Routes.ONBOARDING)
+            val dir = if (forward) 1 else -1
+            (fadeIn(tween(200)) + slideInHorizontally(tween(220)) { if (dir > 0) it / 8 else -it / 8 }) togetherWith
+                fadeOut(tween(160))
+        },
+        label = "页面切换",
+    ) { r ->
+        when (r) {
         null -> Box(Modifier.fillMaxSize())
         Routes.ONBOARDING -> {
             // 首次引导：屏蔽返回键，防误触退出向导（OnboardingFlow 内部也屏蔽）
@@ -56,6 +72,7 @@ fun AppRoot() {
             onOpenSearch = { route = Routes.SEARCH },
             onOpenDownload = { route = Routes.DOWNLOAD },
         )
+    }
     }
 }
 

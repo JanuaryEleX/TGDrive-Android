@@ -126,6 +126,36 @@ interface MediaDao {
     @Query("SELECT display_name FROM media ORDER BY message_date DESC LIMIT :limit")
     suspend fun recentDisplayNames(limit: Int): List<String>
 
+    /** 搜索词与筛选条件同时生效；标题匹配在 SQL 分页之前执行。 */
+    @Query(
+        """
+        SELECT * FROM media
+        WHERE display_name LIKE :pattern ESCAPE '\'
+          AND (:kind IS NULL OR kind = :kind)
+          AND (:minSize IS NULL OR size >= :minSize)
+          AND (:maxSize IS NULL OR size <= :maxSize)
+          AND (:minDurationMs IS NULL OR duration_ms >= :minDurationMs)
+          AND (:maxDurationMs IS NULL OR duration_ms <= :maxDurationMs)
+          AND (:dateFrom IS NULL OR message_date >= :dateFrom)
+          AND (:dateTo IS NULL OR message_date <= :dateTo)
+        ORDER BY
+          CASE WHEN :sortBy = 'name'     AND :desc = 0 THEN display_name END ASC,
+          CASE WHEN :sortBy = 'name'     AND :desc = 1 THEN display_name END DESC,
+          CASE WHEN :sortBy = 'date'     AND :desc = 0 THEN message_date END ASC,
+          CASE WHEN :sortBy = 'date'     AND :desc = 1 THEN message_date END DESC,
+          CASE WHEN :sortBy = 'size'     AND :desc = 0 THEN size END ASC,
+          CASE WHEN :sortBy = 'size'     AND :desc = 1 THEN size END DESC,
+          CASE WHEN :sortBy = 'duration' AND :desc = 0 THEN duration_ms END ASC,
+          CASE WHEN :sortBy = 'duration' AND :desc = 1 THEN duration_ms END DESC
+        LIMIT :limit OFFSET :offset
+        """
+    )
+    suspend fun searchFiltered(
+        pattern: String, kind: String?, minSize: Long?, maxSize: Long?,
+        minDurationMs: Long?, maxDurationMs: Long?, dateFrom: Long?, dateTo: Long?,
+        sortBy: String, desc: Boolean, limit: Int, offset: Int,
+    ): List<MediaEntity>
+
     /**
      * 条件筛选 + 排序 + 分页（全局，跨驱动器）。
      * sortBy ∈ {name,date,size,duration}；desc=true 降序。
