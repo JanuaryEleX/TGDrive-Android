@@ -6,6 +6,26 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class WordCloudGeometryTest {
+    @Test
+    fun realisticPhoneCanvasKeepsMostWordsAndNoOverlap() {
+        // 1080x2400 手机，搜索页卡片可用约 950x1150 px；字号 15~40sp 对应高度约 40~106px
+        val raw = listOf(
+            "第01集" to 34, "花絮" to 21, "1080p" to 19, "国语" to 16, "中字" to 15,
+            "S01E02" to 13, "演唱会" to 12, "现场" to 11, "4K" to 10, "未删减" to 9,
+            "纪录片" to 8, "合集" to 8, "教程" to 7, "备份" to 6, "2024" to 6,
+            "旅行" to 5, "vlog" to 4, "重制" to 3,
+        )
+        val words = raw.map { (text, count) ->
+            val t = (count - 3).toFloat() / (34 - 3)
+            val fontSize = 15f + 25f * t
+            val width = text.length * fontSize * 1.05f
+            val height = fontSize * 1.42f
+            WordCloudGeometry.Word(text, width, height)
+        }
+        val placed = WordCloudGeometry.layout(words, canvasWidth = 950f, canvasHeight = 1150f)
+        println("PLACED=${placed.size}/${words.size}")
+        assertTrue("至少应放下 15 个词，实际 ${placed.size}", placed.size >= 15)
+    }
     private fun words() = listOf(
         WordCloudGeometry.Word("big", 120f, 60f),
         WordCloudGeometry.Word("medium", 70f, 34f),
