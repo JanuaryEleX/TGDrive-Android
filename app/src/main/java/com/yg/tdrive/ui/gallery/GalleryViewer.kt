@@ -437,7 +437,13 @@ private sealed interface OriginalState {
  * 返回 null 表示没拿到全量（区间起点非 0 或文件为空），调用方保持缩略图。
  */
 private suspend fun ensureOriginal(m: MediaEntity, log: (String) -> Unit): java.io.File? {
-    val ref = ServiceLocator.downloadManager.ensureRange(m.fileId, 0L, m.size)
+    val fileId = ServiceLocator.mediaRepository.liveFileId(m)
+    if (fileId <= 0) {
+        log("orig resolve FAIL id=${m.id} storedFileId=${m.fileId}")
+        return null
+    }
+    log("orig resolved id=${m.id} storedFileId=${m.fileId} liveFileId=$fileId")
+    val ref = ServiceLocator.downloadManager.ensureRange(fileId, 0L, m.size)
     val f = java.io.File(ref.partialPath)
     log("orig range id=${m.id} fileId=${m.fileId} size=${m.size} gOff=${ref.globalOffset} disk=${f.length()}")
     if (ref.globalOffset != 0L) return null

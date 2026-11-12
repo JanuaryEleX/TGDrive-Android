@@ -966,6 +966,52 @@ class MediaRepository(
     }
 
     /**
+     * 用持久化的 remote id 换当前 TDLib 会话的 fresh file_id。
+     *
+     * 根因：TDLib 的 file id 只在**当前库会话**内有效，App 重启/重装后旧 id 一律
+     * 报 `400: File not found`。媒体表里存的是扫描当时的 id，所以离线索引一旦跨
+     * 会话复用（看图拿原图、缩略图重下）就必须先换 id。getRemoteFile 只认
+     * remote id，不需要 chat 权限、不发网络请求，比 getMessage 更轻。
+     *
+     * 成功回写 fileId/size 并清 stale；换不到返回 -1（调用方保留旧的失败态）。
+     */
+    suspend fun liveFileId(item: MediaItem): Int {
+        val remoteId = item.remoteFileId.takeIf { it.isNotBlank() } ?: return -1
+        return try {
+            val fileType = when (item.kind) {
+                "image" -> "fileTypePhoto"
+                "video" -> "fileTypeVideo"
+                else -> "fileTypeNone"
+            }
+            val fileObj = td.tdCall(
+                tdObj(
+                    "@type" to "getRemoteFile",
+                    "remote_file_id" to remoteId,
+                    "file_type" to tdObj("@type" to fileType),
+                )
+            )
+            val fileId = fileObj["id"]?.jsonPrimitive?.longOrNull?.toInt() ?: return -1
+            val size = fileObj["size"]?.jsonPrimitive?.longOrNull ?: 0L
+            withContext(Dispatchers.IO) {
+                mediaDao.upsertAll(
+                    listOf(
+                        item.copy(
+                            fileId = fileId,
+                            size = if (size > 0L) size else item.size,
+                            stale = false,
+                        )
+                    )
+                )
+            }
+            fileId
+        } catch (t: Throwable) {
+            if (t is CancellationException) throw t
+            Log.w(TAG, "liveFileId remote=${item.remoteFileId} failed", t)
+            -1
+        }
+    }
+
+    /**
      * 缩略图下载（SPEC §4.2 第3步）：downloadFile(thumbnail.file, 0, 0, priority=2)。
      * 先订阅 fileUpdates 再发起下载（防丢事件），完成后 getFile 快照兜底；
      * 落盘 cacheDir/thumbs/{mediaFileUniqueId}.jpg。返回绝对路径；失败返回 null。
