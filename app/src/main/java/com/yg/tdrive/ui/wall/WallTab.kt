@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -224,11 +225,13 @@ fun MainScreen(
             }
         }
 
-        // ---- 底部三 tab（紧凑高度：默认 80dp 偏高，压到 56dp）----
-        NavigationBar(
-            containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
-            tonalElevation = 0.dp,
-            modifier = Modifier.height(56.dp),
+        // ---- 底部三 tab（纯图标：文字已删，42dp 紧凑高度）----
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(MaterialTheme.colorScheme.surfaceContainerLow)
+                .navigationBarsPadding()
+                .height(42.dp),
         ) {
             val items = listOf(
                 Triple("最近", AppIcons.History, 0),
@@ -236,31 +239,34 @@ fun MainScreen(
                 Triple("图片", AppIcons.Image, 2),
             )
             items.forEach { (label, icon, index) ->
-                NavigationBarItem(
-                    selected = tab == index,
-                    onClick = { tab = index },
-                    icon = {
+                val selected = tab == index
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxHeight()
+                        .clickable { tab = index },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         androidx.compose.material3.Icon(
                             icon,
-                            contentDescription = null,
-                            modifier = Modifier.size(20.dp),
+                            contentDescription = label,
+                            tint = if (selected) MaterialTheme.colorScheme.primary
+                            else MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(if (selected) 23.dp else 21.dp),
                         )
-                    },
-                    label = {
-                        Text(
-                            label,
-                            fontSize = 10.sp,
-                            fontWeight = if (tab == index) FontWeight.SemiBold else FontWeight.Normal,
+                        Spacer(Modifier.height(3.dp))
+                        Box(
+                            modifier = Modifier
+                                .size(width = 14.dp, height = 2.5.dp)
+                                .clip(CircleShape)
+                                .background(
+                                    if (selected) MaterialTheme.colorScheme.primary
+                                    else Color.Transparent,
+                                ),
                         )
-                    },
-                    colors = NavigationBarItemDefaults.colors(
-                        selectedIconColor = MaterialTheme.colorScheme.primary,
-                        selectedTextColor = MaterialTheme.colorScheme.primary,
-                        unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                        unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                        indicatorColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.14f),
-                    ),
-                )
+                    }
+                }
             }
         }
     }
