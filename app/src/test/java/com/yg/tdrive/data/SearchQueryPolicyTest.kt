@@ -24,7 +24,7 @@ class SearchQueryPolicyTest {
     }
 
     @Test fun `like pattern wraps and escapes wildcards`() {
-        assertEquals("%100\\%_x%", SearchQueryPolicy.likePattern("100%_x"))
+        assertEquals("%100\\%\\_x%", SearchQueryPolicy.likePattern("100%_x"))
     }
 
     @Test fun `single chinese char matches substring of a longer name`() {
