@@ -111,6 +111,10 @@ fun MainScreen(
     onOpenDownload: () -> Unit = {},
 ) {
     val authState by ServiceLocator.tdClient.authState.collectAsState()
+    val videoCount by remember { ServiceLocator.mediaRepository.observeKindCount(MediaKind.VIDEO) }
+        .collectAsState(initial = 0)
+    val imageCount by remember { ServiceLocator.mediaRepository.observeKindCount(MediaKind.IMAGE) }
+        .collectAsState(initial = 0)
     // tab 序号：0=最近 1=收藏 2=视频 3=图片。默认仍落在视频（海报墙），保持老用户手感。
     /** 长按底栏后打开该栏筛选；无筛选的最近/收藏保持普通切换。 */
     var filterRequest by remember { mutableStateOf<Int?>(null) }
@@ -132,16 +136,30 @@ fun MainScreen(
                 .padding(start = 18.dp, end = 10.dp, top = 4.dp, bottom = 4.dp),
         ) {
             Column(Modifier.weight(1f)) {
-                Text(
-                    when (tab) {
-                        0 -> "最近"
-                        1 -> "收藏"
-                        2 -> "视频"
-                        else -> "图片"
-                    },
-                    style = MaterialTheme.typography.titleLarge,
-                    color = MaterialTheme.colorScheme.onBackground,
-                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        when (tab) {
+                            0 -> "最近"
+                            1 -> "收藏"
+                            2 -> "视频"
+                            else -> "图片"
+                        },
+                        style = MaterialTheme.typography.titleLarge,
+                        color = MaterialTheme.colorScheme.onBackground,
+                    )
+                    if (tab == BottomBarPolicy.VIDEOS || tab == BottomBarPolicy.IMAGES) {
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            text = (if (tab == BottomBarPolicy.VIDEOS) videoCount else imageCount).toString(),
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(50))
+                                .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.14f))
+                                .padding(horizontal = 9.dp, vertical = 3.dp),
+                        )
+                    }
+                }
                 Text(
                     when (tab) {
                         0 -> "最近播放与新增"

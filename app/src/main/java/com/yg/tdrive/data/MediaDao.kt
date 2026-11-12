@@ -40,6 +40,10 @@ interface MediaDao {
     )
     fun observeWallPaged(driveId: Long, kind: String): PagingSource<Int, MediaEntity>
 
+    /** 顶栏按类型显示已入库总数；不受分页和当前已加载页限制。 */
+    @Query("SELECT COUNT(*) FROM media WHERE kind = :kind")
+    fun observeKindCount(kind: String): Flow<Int>
+
     /**
      * 继续观看：有播放进度且未看完的 video，按进度更新时间倒序取前 20。
      */

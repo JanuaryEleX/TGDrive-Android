@@ -566,6 +566,9 @@ class MediaRepository(
 
     // ═══════════════════════ 观察流 ═══════════════════════
 
+    /** 顶栏视频/图片总数：Room 在扫描入库、删除及重扫时自动通知更新。 */
+    fun observeKindCount(kind: String): Flow<Int> = mediaDao.observeKindCount(kind)
+
     /** 海报墙/图片网格（SPEC §6 observeWall）：Paging3，message_date DESC（idx_media_wall）。 */
     fun observeWall(driveId: Long, kind: String): Flow<PagingData<MediaItem>> =
         Pager(
