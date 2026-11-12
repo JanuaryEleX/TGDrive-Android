@@ -177,6 +177,22 @@ object AppIcons {
         )
     }
 
+    /** 两列网格（切换按钮：当前 2 列时显示）。 */
+    val GridTwo: ImageVector by lazy {
+        icon(
+            "GridTwo",
+            "M3,3h8v8H3V3zM13,3h8v8h-8V3zM3,13h8v8H3v-8zM13,13h8v8h-8v-8z",
+        )
+    }
+
+    /** 三列网格（切换按钮：当前 3 列时显示）。 */
+    val GridThree: ImageVector by lazy {
+        icon(
+            "GridThree",
+            "M2,3h6v8H2V3zM9,3h6v8H9V3zM16,3h6v8h-6V3zM2,13h6v8H2v-8zM9,13h6v8H9v-8zM16,13h6v8h-6v-8z",
+        )
+    }
+
     val Settings: ImageVector by lazy {
         icon(
             "Settings",

@@ -35,6 +35,7 @@ class SettingsStore(private val context: Context) {
         val playerFill = intPreferencesKey("player_fill")
         val librarySort = stringPreferencesKey("library_sort")
         val librarySortDesc = booleanPreferencesKey("library_sort_desc")
+        val wallColumns = intPreferencesKey("wall_columns")
         val themeMode = stringPreferencesKey("theme_mode")          // system|light|dark
         val downloadStoreMode = stringPreferencesKey("download_store_mode") // private|public
     }
@@ -92,6 +93,13 @@ class SettingsStore(private val context: Context) {
     }
     suspend fun setLibrarySortDesc(v: Boolean) =
         context.dataStore.edit { it[K.librarySortDesc] = v }
+
+    /** 海报墙列数：2 或 3，默认 2。 */
+    val wallColumns: Flow<Int> = context.dataStore.data.map {
+        (it[K.wallColumns] ?: 2).coerceIn(2, 3)
+    }
+    suspend fun setWallColumns(v: Int) =
+        context.dataStore.edit { it[K.wallColumns] = v.coerceIn(2, 3) }
 
     /** 主题模式：system|light|dark，默认跟随系统。 */
     val themeMode: Flow<String> = context.dataStore.data.map {

@@ -336,10 +336,10 @@ private fun RecentGrid(items: LazyPagingItems<MediaEntity>) {
         return
     }
     LazyVerticalGrid(
-        columns = GridCells.Fixed(2),
+        columns = GridCells.Fixed(columns),
         contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 16.dp),
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
-        verticalArrangement = Arrangement.spacedBy(18.dp),
+        horizontalArrangement = Arrangement.spacedBy(if (columns >= 3) 9.dp else 12.dp),
+        verticalArrangement = Arrangement.spacedBy(if (columns >= 3) 14.dp else 18.dp),
         modifier = Modifier.fillMaxSize(),
     ) {
         items(count = items.itemCount, key = items.itemKey { it.id }) { index ->
@@ -451,6 +451,8 @@ fun WallTab() {
     var refreshing by remember { mutableStateOf(false) }
     var filter by remember { mutableStateOf(FilterState()) }
     var showFilter by remember { mutableStateOf(false) }
+    // 海报墙列数偏好（2/3 列可切换，持久化在 DataStore）
+    val wallColumns by ServiceLocator.settings.wallColumns.collectAsState(initial = 2)
 
     if (showFilter) {
         FilterSheet(
@@ -493,6 +495,16 @@ fun WallTab() {
             horizontalArrangement = Arrangement.End,
             verticalAlignment = Alignment.CenterVertically,
         ) {
+            // 布局切换：2 列 ⇄ 3 列（偏好持久化，切换后 Paging 与 Coil 缓存复用）
+            LayoutToggleButton(
+                columns = wallColumns,
+                onToggle = {
+                    ServiceLocator.appScope.launch {
+                        ServiceLocator.settings.setWallColumns(if (wallColumns >= 3) 2 else 3)
+                    }
+                },
+            )
+            Spacer(Modifier.size(8.dp))
             FilterButton(active = filter.isActive(), onClick = { showFilter = true })
         }
 
@@ -526,12 +538,38 @@ fun WallTab() {
                 }
             },
         ) {
-            WallGrid(wallItems) { detailFor = it }
+            WallGrid(wallItems, columns = wallColumns) { detailFor = it }
         }
     }
 
     if (detailFor != null) {
         MediaDetailSheet(media = detailFor!!, onDismiss = { detailFor = null })
+    }
+}
+
+/** 布局切换按钮：2 列 ⇄ 3 列。 */
+@Composable
+private fun LayoutToggleButton(columns: Int, onToggle: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .clip(RoundedCornerShape(50))
+            .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+            .clickable(onClick = onToggle)
+            .padding(horizontal = 12.dp, vertical = 7.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        androidx.compose.material3.Icon(
+            if (columns >= 3) AppIcons.GridThree else AppIcons.GridTwo,
+            contentDescription = if (columns >= 3) "切换到两列" else "切换到三列",
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.size(16.dp),
+        )
+        Spacer(Modifier.width(5.dp))
+        Text(
+            if (columns >= 3) "三列" else "两列",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 
@@ -561,14 +599,18 @@ private fun DriveChip(label: String, selected: Boolean, onClick: () -> Unit) {
 // ---------------------------------------------------------------- 海报 Grid
 
 @Composable
-private fun WallGrid(items: LazyPagingItems<MediaEntity>, onInfo: (MediaEntity) -> Unit) {
+private fun WallGrid(
+    items: LazyPagingItems<MediaEntity>,
+    onInfo: (MediaEntity) -> Unit,
+    columns: Int = 2,
+) {
     val context = LocalContext.current
     when {
         // 扫描/补封面期间 Room 每次写库都会 invalidate PagingSource，
         // loadState.refresh 反复回到 Loading。只在「确实没有数据」时显示骨架屏，
         // 否则列表会被骨架屏顶掉再重建，表现为持续屏闪。
         items.loadState.refresh is LoadState.Loading && items.itemCount == 0 -> {
-            PosterSkeletonGrid()
+            PosterSkeletonGrid(columns)
         }
         items.itemCount == 0 -> {
             Column(
@@ -586,10 +628,10 @@ private fun WallGrid(items: LazyPagingItems<MediaEntity>, onInfo: (MediaEntity) 
         else -> {
             Column(Modifier.fillMaxSize()) {
                 LazyVerticalGrid(
-                    columns = GridCells.Fixed(2),
+                    columns = GridCells.Fixed(columns),
                     contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 16.dp),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                    verticalArrangement = Arrangement.spacedBy(18.dp),
+                    horizontalArrangement = Arrangement.spacedBy(if (columns >= 3) 9.dp else 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(if (columns >= 3) 14.dp else 18.dp),
                 ) {
                     items(
                         count = items.itemCount,
@@ -620,16 +662,16 @@ private fun WallGrid(items: LazyPagingItems<MediaEntity>, onInfo: (MediaEntity) 
 
 /** 骨架屏：加载中占位，避免白屏抖动。 */
 @Composable
-private fun PosterSkeletonGrid() {
+private fun PosterSkeletonGrid(columns: Int = 2) {
     LazyVerticalGrid(
-        columns = GridCells.Fixed(2),
+        columns = GridCells.Fixed(columns),
         contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 16.dp),
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
-        verticalArrangement = Arrangement.spacedBy(18.dp),
+        horizontalArrangement = Arrangement.spacedBy(if (columns >= 3) 9.dp else 12.dp),
+        verticalArrangement = Arrangement.spacedBy(if (columns >= 3) 14.dp else 18.dp),
         userScrollEnabled = false,
         modifier = Modifier.fillMaxSize(),
     ) {
-        items(8) {
+        items(if (columns >= 3) 12 else 8) {
             Column {
                 Box(
                     Modifier
