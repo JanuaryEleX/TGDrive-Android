@@ -1048,19 +1048,12 @@ class MediaRepository(
         return if (flat.length > 120) flat.take(120).trimEnd() else flat
     }
 
-    /** 取消息的相册/媒体描述正文：caption 挂在 content 的媒体对象上（formattedText.text）。 */
-    private fun captionOf(msg: JsonObject): String? {
-        val content = msg["content"] as? JsonObject ?: return null
-        val media = when ((content["@type"] as? JsonPrimitive)?.content) {
-            "messageVideo" -> content["video"]
-            "messagePhoto" -> content["photo"]
-            "messageDocument" -> content["document"]
-            "messageAnimation" -> content["animation"]
-            else -> null
-        } as? JsonObject ?: return null
-        val ft = media["caption"] as? JsonObject ?: return null
-        return (ft["text"] as? JsonPrimitive)?.content
-    }
+    /**
+     * 取消息的相册/媒体描述正文。位置判断见 [CaptionParser]（caption 可能在 content 顶层，
+     * 也可能在媒体对象内部；只看后者会漏掉全部相册描述）。
+     */
+    private fun captionOf(msg: JsonObject): String? =
+        CaptionParser.captionOf(msg["content"] as? JsonObject)
 
     /**
      * TDLib message → (MediaEntity, thumbnailFile?)；非视频/图片消息返回 null。
