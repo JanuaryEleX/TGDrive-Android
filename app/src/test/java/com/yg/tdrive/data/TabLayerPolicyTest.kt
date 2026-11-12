@@ -7,7 +7,7 @@ import org.junit.Test
 
 class TabLayerPolicyTest {
     @Test fun activeTabIsOnTopOfEveryOtherPage() {
-        listOf(0, 1, 2, 3).forEach { other ->
+        listOf(0, 1, 3).forEach { other ->
             assertTrue(
                 "活动页应高于 $other",
                 TabLayerPolicy.zIndex(2, active = 2) > TabLayerPolicy.zIndex(other, active = 2),
