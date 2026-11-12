@@ -1,20 +1,21 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- TGDrive：云盘圆角框 + 纸飞机。108dp 自适应视口，主体限制在中央安全区。 -->
+<!-- TGDrive adaptive icon: a single bold paper plane carrying a cloud-shaped storage cutout.
+     108dp canvas; artwork stays inside the central 72dp safe zone. -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <!-- 云盘轮廓：底部圆润托盘与顶部云顶连成一个整体。 -->
+    <!-- The plane body is a clear upward-right silhouette, visible even at 48px. -->
     <path
         android:fillColor="#FFFFFF"
-        android:pathData="M28,72 C22,72 18,67.5 18,62 C18,56.5 22,52 27.4,51 C30,40 38,34 48,34 C56,34 62,38 66,44 C67.9,43.3 69.8,43 72,43 C82.2,43 90,50.9 90,61 C90,67.6 85.3,72 79,72 L28,72 Z" />
-    <!-- 飞机：与白色云盘形成深蓝负形，尾翼指向左下；不使用旧版闪电素材。 -->
+        android:pathData="M18,53.7 C16.4,52.9 16.6,50.6 18.5,50 L88,29.2 C90.1,28.6 91.7,30.5 90.8,32.4 L62.4,82.2 C61.4,83.9 59.1,83.8 58.2,82 L48,62.8 L33.4,73.6 C31.9,74.7 29.7,73.7 29.7,71.8 L29.7,57.5 Z" />
+    <!-- Wide sky-blue fold (no hairline): separates the upper and lower wings. -->
+    <path
+        android:fillColor="#50D6E7"
+        android:pathData="M34,57.8 L79.8,35.1 L47.7,63.2 L34,72 Z" />
+    <!-- Inner edge: negative-space fold is broad enough to remain legible at launcher size. -->
     <path
         android:fillColor="#1765A2"
-        android:pathData="M37,55 L75,47 C77.1,46.6 78.5,48.4 77.4,50.2 L60.1,69.2 C59.3,70 58.3,69.8 58,68.8 L53.4,60.2 L46,65.6 C44.7,66.5 43.3,65.7 43.4,64.4 L43.7,57.4 Z" />
-    <!-- 机翼高光，保持小尺寸仍可辨认。 -->
-    <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M47,57.5 L70,51.4 L51,59.7 L47,62.1 Z" />
+        android:pathData="M47.7,63.2 L79.8,35.1 L54.2,63.7 L59.8,76.5 Z" />
 </vector>
