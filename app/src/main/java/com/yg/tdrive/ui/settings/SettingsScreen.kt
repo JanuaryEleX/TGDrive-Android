@@ -9,8 +9,12 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
@@ -19,6 +23,8 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -48,6 +54,7 @@ import com.yg.tgdrive.BuildConfig
 import com.yg.tgdrive.CrashLogger
 import com.yg.tgdrive.ServiceLocator
 import com.yg.tgdrive.data.ScanDiagnostics
+import com.yg.tgdrive.data.SelectableChat
 import com.yg.tgdrive.ui.common.DriveEntity
 import com.yg.tgdrive.ui.common.ProxyEditor
 import com.yg.tgdrive.ui.common.ProxyMode
@@ -339,6 +346,7 @@ private fun DriveSection() {
     val scope = rememberCoroutineScope()
     var confirmDeleteFor by remember { mutableStateOf<DriveEntity?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
+    var showAdd by remember { mutableStateOf(false) }
 
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp)) {
@@ -388,7 +396,26 @@ private fun DriveSection() {
                 Spacer(Modifier.height(8.dp))
                 Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
             }
+
+            Spacer(Modifier.height(4.dp))
+            OutlinedButton(
+                onClick = {
+                    error = null
+                    showAdd = true
+                },
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("＋ 新增驱动器")
+            }
         }
+    }
+
+    if (showAdd) {
+        AddDriveDialog(
+            existingChatIds = drives.map { it.chatId }.toSet(),
+            onDismiss = { showAdd = false },
+            onError = { error = it },
+        )
     }
 
     if (confirmDeleteFor != null) {
@@ -413,6 +440,133 @@ private fun DriveSection() {
             dismissButton = { TextButton(onClick = { confirmDeleteFor = null }) { Text("取消") } },
         )
     }
+}
+
+// ---------------------------------------------------------------- 新增驱动器
+
+/**
+ * 新增驱动器对话框：拉取 TG 聊天列表供勾选，已入库的驱动器置灰不可选。
+ * 选中后走 DriveManager.addDrive（chat_id UNIQUE 幂等）并立即首扫，
+ * 与引导页 DrivePickerStep 的行为保持一致。
+ */
+@Composable
+private fun AddDriveDialog(
+    existingChatIds: Set<Long>,
+    onDismiss: () -> Unit,
+    onError: (String) -> Unit,
+) {
+    val scope = rememberCoroutineScope()
+    var loading by remember { mutableStateOf(true) }
+    var saving by remember { mutableStateOf(false) }
+    var chats by remember { mutableStateOf<List<SelectableChat>>(emptyList()) }
+    var picked by remember { mutableStateOf<Set<Long>>(emptySet()) }
+    var loadError by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(Unit) {
+        try {
+            chats = ServiceLocator.driveManager.listSelectableChats()
+        } catch (t: Throwable) {
+            loadError = "拉取聊天列表失败：${t.message ?: t::class.java.simpleName}"
+        }
+        loading = false
+    }
+
+    AlertDialog(
+        onDismissRequest = { if (!saving) onDismiss() },
+        title = { Text("新增驱动器") },
+        text = {
+            Column {
+                Text(
+                    "勾选用作存储的频道/群组，保存后立即执行首次全量扫描。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(8.dp))
+                when {
+                    loading -> Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        modifier = Modifier.padding(vertical = 16.dp),
+                    ) {
+                        CircularProgressIndicator(modifier = Modifier.size(18.dp))
+                        Text("正在拉取聊天列表…", style = MaterialTheme.typography.bodyMedium)
+                    }
+                    loadError != null -> Text(
+                        loadError!!,
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    chats.isEmpty() -> Text(
+                        "没有可选的频道/群组",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    else -> LazyColumn(Modifier.heightIn(max = 320.dp)) {
+                        items(chats, key = { it.chatId }) { chat ->
+                            val already = chat.chatId in existingChatIds
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Checkbox(
+                                    checked = already || chat.chatId in picked,
+                                    enabled = !already && !saving,
+                                    onCheckedChange = { on ->
+                                        picked = if (on) picked + chat.chatId
+                                        else picked - chat.chatId
+                                    },
+                                )
+                                Column(Modifier.padding(start = 2.dp)) {
+                                    Text(
+                                        chat.title,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = if (already) {
+                                            MaterialTheme.colorScheme.onSurfaceVariant
+                                        } else {
+                                            MaterialTheme.colorScheme.onSurface
+                                        },
+                                    )
+                                    Text(
+                                        if (already) "已添加" else chat.type,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = !saving && picked.isNotEmpty(),
+                onClick = {
+                    saving = true
+                    scope.launch {
+                        try {
+                            val added = chats.filter { it.chatId in picked }.map {
+                                ServiceLocator.driveManager.addDrive(it.chatId, it.title)
+                            }
+                            // 首扫是分钟级任务，挂 appScope 避免对话框关闭后协程被取消
+                            ServiceLocator.appScope.launch {
+                                added.forEach { d ->
+                                    runCatching { ServiceLocator.mediaRepository.fullScan(d.id) }
+                                }
+                            }
+                            onDismiss()
+                        } catch (t: Throwable) {
+                            onError("新增驱动器失败：${t.message}")
+                            saving = false
+                        }
+                    }
+                },
+            ) { Text(if (saving) "保存中…" else "保存") }
+        },
+        dismissButton = {
+            TextButton(enabled = !saving, onClick = onDismiss) { Text("取消") }
+        },
+    )
 }
 
 // ---------------------------------------------------------------- API 凭据

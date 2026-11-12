@@ -29,6 +29,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
 import java.io.File
@@ -393,7 +394,29 @@ class MediaRepository(
      * 调用方保证 `messages` 里没有本轮已处理过的 id（重复调用不会重复解析/下载）。
      */
     private suspend fun ingestPage(chatId: Long, driveId: Long, messages: List<JsonObject>): PageIngest {
-        val parsed = messages.mapNotNull { parseMedia(chatId, driveId, it) }
+        val parsedRaw = messages.mapNotNull { parseMedia(chatId, driveId, it) }
+        // ── 相册命名规则 ──
+        // 同一 media_album_id 的整组消息若带文字描述（caption），视频一律以该描述命名
+        // （不带文件后缀）；组内没有文字描述时才回退到视频自身的文件名。
+        // 相册的 caption 通常只挂在其中一条消息上，所以必须按组跨消息汇总后再统一命名。
+        val albumCaptions: Map<Long, String> = buildMap {
+            for (msg in messages) {
+                val albumId = msg["media_album_id"]?.jsonPrimitive?.longOrNull
+                    ?.takeIf { it != 0L } ?: continue
+                if (containsKey(albumId)) continue
+                val cap = msg["caption"]?.jsonObject
+                    ?.get("text")?.jsonObject
+                    ?.get("text")?.jsonPrimitive?.contentOrNull
+                    ?.let { sanitizeCaption(it) }
+                if (!cap.isNullOrBlank()) put(albumId, cap)
+            }
+        }
+        val parsed = parsedRaw.map { pair ->
+            val entity = pair.first
+            if (entity.kind != MediaKind.VIDEO) return@map pair
+            val cap = entity.mediaAlbumId?.let { albumCaptions[it] } ?: return@map pair
+            pair.copy(first = entity.copy(displayName = cap, originalName = cap))
+        }
         if (parsed.isEmpty()) return PageIngest(0, emptyMap())
         val entities = parsed.map { it.first }
         val rowIds = withContext(Dispatchers.IO) { mediaDao.insertAllIgnoring(entities) }
@@ -850,6 +873,25 @@ class MediaRepository(
     }
 
     // ═══════════════════════ 内部：解析 ═══════════════════════
+
+    /**
+     * TDLib message → (MediaEntity, thumbnailFile?)；非视频/图片消息返回 null。
+     * kind 判定：messageVideo=video；messagePhoto=image；messageDocument 且
+     * mime 以 video/ 开头或后缀 ∈ {mp4,mkv,avi,mov,webm,ts,m4v} → video，其余 null。
+     */
+    /**
+     * 相册描述清洗成可用作显示名/文件名的字符串：压平换行、去掉路径与非法字符、
+     * 折叠重复空白、限制长度。描述为空时返回空串（调用方回退原文件名）。
+     */
+    private fun sanitizeCaption(raw: String): String {
+        val flat = raw.replace(Regex("[\\r\\n\\t]+"), " ")
+            .replace('/', '／').replace('\\', '＼')
+            .replace(Regex("[\\p{Cntrl}]"), "")
+            .replace(Regex("\\s{2,}"), " ")
+            .trim()
+        if (flat.isEmpty()) return ""
+        return if (flat.length > 120) flat.take(120).trimEnd() else flat
+    }
 
     /**
      * TDLib message → (MediaEntity, thumbnailFile?)；非视频/图片消息返回 null。
