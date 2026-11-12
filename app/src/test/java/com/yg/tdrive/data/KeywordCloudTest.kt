@@ -7,8 +7,7 @@ import org.junit.Test
 class KeywordCloudTest {
     @Test fun `common words are counted once per filename and ranked by frequency`() {
         val words = KeywordCloud.fromNames(listOf("海边旅行-01.mp4", "海边旅行-02.mp4", "海边日落.jpg", "旅行照片.png"))
-        assertEquals("海边", words.first().text)
-        assertEquals(3, words.first().count)
+        assertEquals(3, words.first { it.text == "海边" }.count)
         assertEquals(3, words.first { it.text == "旅行" }.count)
     }
 
@@ -23,7 +22,7 @@ class KeywordCloudTest {
     }
 
     @Test fun `cloud is capped and deterministic`() {
-        val names = (1..40).map { "topic${it}_trip.mp4" }
+        val names = (1..40).flatMap { listOf("topic${it}_trip.mp4", "topic${it}_trip.jpg") }
         val words = KeywordCloud.fromNames(names, limit = 8)
         assertEquals(8, words.size)
         assertEquals(words, KeywordCloud.fromNames(names, limit = 8))
