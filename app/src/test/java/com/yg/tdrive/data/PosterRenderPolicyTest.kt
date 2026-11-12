@@ -6,24 +6,19 @@ import org.junit.Test
 
 class PosterRenderPolicyTest {
     @Test
-    fun `three columns use compact decoration while two columns keep regular layout`() {
-        assertEquals(PosterRenderPolicy.Decoration.REGULAR, PosterRenderPolicy.decoration(2))
-        assertEquals(PosterRenderPolicy.Decoration.COMPACT, PosterRenderPolicy.decoration(3))
+    fun `three columns drop the per poster gradient to cut one draw per cell`() {
+        assertTrue(!PosterRenderPolicy.decoration(3).drawGradient)
+        assertTrue(!PosterRenderPolicy.decoration(4).drawGradient)
     }
 
     @Test
-    fun `compact decoration removes the per poster gradient without removing duration or details`() {
-        val compact = PosterRenderPolicy.decoration(3)
-        assertTrue(!compact.drawGradient)
-        assertTrue(compact.showDuration)
-        assertTrue(compact.showDetails)
+    fun `two columns keep the existing poster look`() {
+        assertTrue(PosterRenderPolicy.decoration(2).drawGradient)
+        assertTrue(PosterRenderPolicy.decoration(1).drawGradient)
     }
 
     @Test
-    fun `regular decoration retains the existing poster look`() {
-        val regular = PosterRenderPolicy.decoration(2)
-        assertTrue(regular.drawGradient)
-        assertTrue(regular.showDuration)
-        assertTrue(regular.showDetails)
+    fun `decoration is decided only by column count so callers stay cheap`() {
+        assertEquals(PosterRenderPolicy.decoration(2), PosterRenderPolicy.decoration(2))
     }
 }

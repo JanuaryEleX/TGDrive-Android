@@ -711,6 +711,11 @@ private fun WallGrid(
         }
         else -> {
             Column(Modifier.fillMaxSize()) {
+                // 解码尺寸在网格级算一次：原来每个格子各读一遍 LocalConfiguration /
+                // LocalDensity 再算一遍，格子越多这部分重组开销越明显（三列一屏约 14 格）。
+                val screenWidthDp = LocalConfiguration.current.screenWidthDp
+                val density = LocalDensity.current.density
+                val posterPx = com.yg.tdrive.data.PosterSizing.decodePx(screenWidthDp, columns, density)
                 LazyVerticalGrid(
                     columns = GridCells.Fixed(columns),
                     contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 16.dp),
@@ -725,6 +730,7 @@ private fun WallGrid(
                         PosterCell(
                             m,
                             columns = columns,
+                            posterPx = posterPx,
                             onPlay = { target ->
                                 if (onPlayOverride != null) {
                                     onPlayOverride(target)
@@ -856,6 +862,8 @@ private fun ContinueWatchingRow() {
 internal fun PosterCell(
     m: MediaEntity,
     columns: Int = 2,
+    /** 网格级算好的解码像素；0 = 自己算（单独调用时用）。 */
+    posterPx: Int = 0,
     onPlay: (MediaEntity) -> Unit,
     onInfo: (MediaEntity) -> Unit,
 ) {
@@ -877,18 +885,20 @@ internal fun PosterCell(
                     )
                 },
         ) {
-            // 解码尺寸按列数/屏幕宽度实时算：三列每格更小，按原图或固定 400px 解码
-            // 会让 UI 线程在滚动时忙于 Bitmap 分配（实测三列中位帧耗时 44ms）。
-            val config = LocalConfiguration.current
-            val density = LocalDensity.current.density
+            // 解码尺寸：网格级已算好直接复用；单独调用时才自己算。
+            // 三列每格更小，按原图或固定 400px 解码会让 UI 线程忙于 Bitmap 分配。
+            val px = posterPx.takeIf { it > 0 } ?: run {
+                val config = LocalConfiguration.current
+                val density = LocalDensity.current.density
+                com.yg.tdrive.data.PosterSizing.decodePx(config.screenWidthDp, columns, density)
+            }
             val ctx = LocalContext.current
-            val posterPx = com.yg.tdrive.data.PosterSizing.decodePx(config.screenWidthDp, columns, density)
             // ImageRequest 必须在 composition 外构建一次：每次重组 new 一个 Builder
-            // 会让 Coil 认为请求变了，反复重建、丢弃缓存键。
-            val posterModel = remember(m.thumbPath, posterPx) {
+            // 会让 Coil 认为请求变了、反复重建并丢弃缓存键。
+            val posterModel = remember(m.thumbPath, px) {
                 ImageRequest.Builder(ctx)
                     .data(m.thumbPath?.let { java.io.File(it) })
-                    .size(posterPx)
+                    .size(px)
                     .crossfade(false)
                     .build()
             }
@@ -899,19 +909,23 @@ internal fun PosterCell(
                 modifier = Modifier.fillMaxSize(),
             )
 
-            // 底部极轻渐变，只为托住时长胶囊，不压暗画面
-            Box(
-                Modifier
-                    .align(Alignment.BottomCenter)
-                    .fillMaxWidth()
-                    .height(46.dp)
-                    .background(
-                        Brush.verticalGradient(
-                            0f to Color.Transparent,
-                            1f to Color.Black.copy(alpha = 0.6f),
-                        )
-                    ),
-            )
+            // 底部极轻渐变，只为托住时长胶囊，不压暗画面。
+            // 三列一屏格子数约为两列两倍，逐格渐变就多出一整层绘制，按策略省掉；
+            // 时长胶囊自带深色底，去掉渐变后仍然清晰。
+            if (com.yg.tdrive.data.PosterRenderPolicy.decoration(columns).drawGradient) {
+                Box(
+                    Modifier
+                        .align(Alignment.BottomCenter)
+                        .fillMaxWidth()
+                        .height(46.dp)
+                        .background(
+                            Brush.verticalGradient(
+                                0f to Color.Transparent,
+                                1f to Color.Black.copy(alpha = 0.6f),
+                            )
+                        ),
+                )
+            }
 
             val dur = formatDuration(m.durationMs)
             if (dur.isNotEmpty()) {
