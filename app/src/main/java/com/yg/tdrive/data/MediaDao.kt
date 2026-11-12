@@ -202,6 +202,10 @@ interface MediaDao {
     @Query("SELECT * FROM media WHERE drive_id = :driveId")
     suspend fun getAllByDrive(driveId: Long): List<MediaEntity>
 
+    /** 增量扫描停止判定：本页中哪些 message_id 已在库里（= 旧消息）。 */
+    @Query("SELECT message_id FROM media WHERE chat_id = :chatId AND message_id IN (:messageIds)")
+    suspend fun existingMessageIds(chatId: Long, messageIds: List<Long>): List<Long>
+
     /** M2 缩略图回写。 */
     @Query("UPDATE media SET thumb_path = :thumbPath WHERE id = :id")
     suspend fun updateThumbPath(id: Long, thumbPath: String?)

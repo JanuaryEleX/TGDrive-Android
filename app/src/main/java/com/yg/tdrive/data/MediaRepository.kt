@@ -231,7 +231,7 @@ class MediaRepository(
             ScanDiagnostics.dbKindCounts(
                 mediaDao.getAllByDrive(driveId).groupingBy { it.kind }.eachCount()
             )
-            if (oldestReached > 0) driveDao.setLastScannedMessageId(driveId, oldestReached)
+            if (newestId > 0L) driveDao.setLastScannedMessageId(driveId, newestId)
             driveDao.setScanState(driveId, ScanState.ERROR)
         } catch (t: Throwable) {
             if (t is CancellationException) {
@@ -250,11 +250,14 @@ class MediaRepository(
     }
 
     /**
-     * 增量同步（SPEC §4.2 第4步）：从当前 last_message 向下扫到 last_scanned_message_id
-     * 为止（仅 strictly newer 消息入库）。无新消息幂等返回。
+     * 增量同步（SPEC §4.2 第4步）：从聊天最新消息往下扫，**扫到库里已有的旧消息就停**
+     * （或碰到检查点 last_scanned_message_id 为止），只把新消息入库。
      *
-     * 与 fullScan 同一套翻页规则：页内重复 id 只解析一次；无新 id 的同页重试有上限，
-     * 耗尽 → ERROR 且 last_scanned 只推进到本轮到达的最老 id（不谎报 newestId）。
+     * 关键约束（修复「下滑一次就全量重扫」）：
+     * - 检查点是「已索引区间的上界」，只前进不回退。
+     * - 历史没扫全（无检查点 / scan_state != done）时，下拉刷新只取最新一页，
+     *   全量交给设置页「重扫」，绝不在这里静默走完整段历史。
+     * - 无新消息时幂等返回。
      */
     suspend fun incrementalSync(driveId: Long) {
         val drive = driveDao.getById(driveId) ?: return
@@ -264,26 +267,32 @@ class MediaRepository(
         var inserted = 0
         var emptyRetries = 0
         var stuckRetries = 0
-        var oldestReached = 0L
         val processedIds = HashSet<Long>()
         val roundThumbs = HashMap<Long, JsonObject>()
         publishProgress(ScanProgress(driveId = driveId, running = true))
         try {
             val chatId = drive.chatId
             val stopId = drive.lastScannedMessageId
+            val wasFullyScanned = !IncrementalScanPolicy.needsFullScan(stopId, drive.scanState)
+            // 没有检查点（从未建索引 / 历史没扫全）时，下拉刷新只取最新一页，
+            // 绝不在这里悄悄走完整段历史 —— 全量走设置页「重扫」。
+            val pageBudget = if (wasFullyScanned) Int.MAX_VALUE else 1
             val chat = td.tdCall(tdObj("@type" to "getChat", "chat_id" to chatId))
             val lastMessage = chat["last_message"] as? JsonObject
             if (lastMessage == null) {
-                driveDao.setScanState(driveId, ScanState.DONE)
+                if (wasFullyScanned) driveDao.setScanState(driveId, ScanState.DONE)
                 return
             }
             val newestId = lastMessage["id"]?.jsonPrimitive?.longOrNull ?: 0L
             if (newestId <= stopId) {
-                driveDao.setScanState(driveId, ScanState.DONE)
+                if (wasFullyScanned) driveDao.setScanState(driveId, ScanState.DONE)
                 return
             }
             var fromMessageId = newestId
+            var pagesFetched = 0
             while (true) {
+                if (pagesFetched >= pageBudget) break
+                pagesFetched++
                 ScanDiagnostics.page(fromMessageId)
                 val resp = callWithFloodRetry(
                     tdObj(
@@ -333,13 +342,13 @@ class MediaRepository(
                 }
                 stuckRetries = 0
                 processedIds.addAll(pageIds)
-                pageIds.forEach { id ->
-                    if (oldestReached == 0L || id < oldestReached) oldestReached = id
-                }
 
-                val stopHere = messages.any {
-                    (it["id"]?.jsonPrimitive?.longOrNull ?: 0L) <= stopId
-                }
+                // 「从最新的往下扫，扫到旧的为止」：本页出现库里已有的消息即停，
+                // 而不是每次下滑把所有历史重新走一遍。
+                val knownIds = mediaDao.existingMessageIds(chatId, pageIds.filter { it > 0L })
+                val stopHere =
+                    IncrementalScanPolicy.reachedOldMessages(pageIds, stopId) ||
+                        IncrementalScanPolicy.reachedKnownMessages(pageIds, knownIds.toSet())
                 val toIngest = fresh.filter {
                     (it["id"]?.jsonPrimitive?.longOrNull ?: 0L) > stopId
                 }
@@ -360,13 +369,16 @@ class MediaRepository(
             ScanDiagnostics.dbKindCounts(
                 mediaDao.getAllByDrive(driveId).groupingBy { it.kind }.eachCount()
             )
-            driveDao.setLastScannedMessageId(driveId, newestId)
-            driveDao.setScanState(driveId, ScanState.DONE)
-        } catch (e: ScanIncompleteException) {
-            Log.e(TAG, "incrementalSync drive=$driveId incomplete: ${e.message}")
-            ScanDiagnostics.error(e.message ?: "incomplete")
-            if (oldestReached > 0) driveDao.setLastScannedMessageId(driveId, oldestReached)
-            driveDao.setScanState(driveId, ScanState.ERROR)
+            // 检查点只前进到当前最新消息（上界），失败/未扫全时保持原值，
+            // 不回退到「本轮到达的最老 id」—— 那会让下次下拉重复走老消息。
+            driveDao.setLastScannedMessageId(
+                driveId,
+                IncrementalScanPolicy.checkpointAfterSuccess(stopId, newestId),
+            )
+            // 只有原本历史已扫全的驱动器才保持 DONE；否则不要谎报完成。
+            if (!IncrementalScanPolicy.needsFullScan(stopId, drive.scanState)) {
+                driveDao.setScanState(driveId, ScanState.DONE)
+            }
         } catch (t: Throwable) {
             if (t is CancellationException) {
                 ScanDiagnostics.error("cancelled")
