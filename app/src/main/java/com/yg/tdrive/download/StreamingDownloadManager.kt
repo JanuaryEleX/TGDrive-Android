@@ -144,10 +144,58 @@ class StreamingDownloadManager(
         @Volatile var downloadedSize = 0L
 
         /**
-         * 已确认落盘的最高偏移（磁盘真值水位，跨请求单调不减 —— 落盘数据不会被删）。
-         * 读路径据此钳制单次 read 长度，绝不让 TDLib 预分配的全零区当数据交给解析器。
+         * 已确认落盘的**连续区间账本**（升序、互不重叠、[start, end) 闭开区间）。
+         *
+         * 旧实现是一个单调递增的「最高偏移水位」，语义上只对从 0 起的连续前缀成立；
+         * 一旦在文件尾探针成功（moov-at-tail 的正常路径），水位被抬到尾部，
+         * 于是 0..尾部之间**根本没落盘的空洞**也全部被判为可读，读出去全是 TDLib
+         * 预分配的全零字节 —— Mp4Extractor 把零当 box header 解析，最终报
+         * "Loading finished before preparation is complete"。这是大视频必挂的根因。
+         *
+         * 现在只认「真的连续」的区间：落在区间内才算已落盘，空洞一律返回 0。
          */
-        @Volatile var confirmedEnd = 0L
+        private val ranges = ArrayList<LongArray>()
+        private val rangesLock = Any()
+
+        /** 标记 [from, to) 已落盘（合并到账本）。 */
+        fun markReadable(from: Long, to: Long) {
+            if (to <= from) return
+            synchronized(rangesLock) {
+                var s = from
+                var e = to
+                val out = ArrayList<LongArray>(ranges.size + 1)
+                var inserted = false
+                for (r in ranges) {
+                    when {
+                        r[1] < s -> out.add(r)                      // 完全在前
+                        r[0] > e -> {                               // 完全在后
+                            if (!inserted) { out.add(longArrayOf(s, e)); inserted = true }
+                            out.add(r)
+                        }
+                        else -> { s = minOf(s, r[0]); e = maxOf(e, r[1]) }  // 相邻/重叠 → 合并
+                    }
+                }
+                if (!inserted) out.add(longArrayOf(s, e))
+                ranges.clear()
+                ranges.addAll(out)
+            }
+        }
+
+        /** 清空账本（陈旧状态重置后，磁盘真值待重新确认）。 */
+        fun clearReadable() = synchronized(rangesLock) { ranges.clear() }
+
+        /** 从 [pos] 起**连续**已落盘的字节数（落在空洞里 = 0）。 */
+        fun readableFrom(pos: Long): Long = synchronized(rangesLock) {
+            for (r in ranges) {
+                if (pos >= r[0] && pos < r[1]) return r[1] - pos
+                if (r[0] > pos) return 0L
+            }
+            0L
+        }
+
+        /** 账本里最高已确认偏移（只用于诊断/前视判断，不代表中间连续）。 */
+        val confirmedEnd: Long
+            get() = synchronized(rangesLock) { ranges.lastOrNull()?.get(1) ?: 0L }
 
         /** 发过新请求后丢弃旧引用 update 的开关，直到该请求的响应建立基线。 */
         @Volatile var awaitingBaseline = true
@@ -274,8 +322,12 @@ class StreamingDownloadManager(
         }
         val path = s.partialPath.value ?: throw DownloadException("file $fileId 无 partial 路径")
         val fileLen = File(path).length()
-        // partial 已是完整尺寸（TDLib 预分配）→ 绝对偏移；否则该文件从请求起点开始。
-        val globalOffset = if (expected > 0L && fileLen >= expected) 0L else s.base.coerceAtLeast(0L)
+        // partial 文件的坐标原点判定：
+        // - 文件长度 > 请求起点 → TDLib 是「按绝对偏移写」的同一个临时文件，字节 0 = 文件起点；
+        // - 否则内容从 base 顺序长出来，字节 0 = base。
+        // （旧判断只在「文件长度已达完整尺寸」时才用绝对坐标，跳读过的文件会被误判成相对坐标，
+        //   进而 seek 到错误位置读到空洞 → 同样表现为全零数据。）
+        val globalOffset = if (s.base > 0L && fileLen > s.base) 0L else s.base.coerceAtLeast(0L)
         return PartialRef(path, globalOffset)
     }
 
@@ -467,7 +519,7 @@ class StreamingDownloadManager(
                 .onFailure { Log.w(TAG, "deleteFile ${s.fileId} failed: ${it.message}") }
             s.completed.value = false
             s.readable.value = 0L
-            s.confirmedEnd = 0L
+            s.clearReadable()
             s.downloadedSize = 0L
             s.base = -1L
             s.partialPath.value = null
@@ -613,8 +665,10 @@ class StreamingDownloadManager(
                     PlaybackDiag.probe(offset, polls, lastNonZero, SystemClock.elapsedRealtime() - t0, "completed")
                     return
                 }
-                // 水位已覆盖需求（含 TDLib 连续前缀推进 + 之前探针确认过的区间）
-                if (s.confirmedEnd - offset >= need) {
+                // 需求整段落在某个「连续已确认区间」内 → 快路径放行。
+                // 注意必须用 readableFrom（连续语义），不能用最高水位：尾部探针成功
+                // 不代表中间已落盘，否则会把全零空洞当数据交出去。
+                if (s.readableFrom(offset) >= need) {
                     PlaybackDiag.probe(offset, polls, lastNonZero, SystemClock.elapsedRealtime() - t0, "confirmed")
                     return
                 }
@@ -623,7 +677,8 @@ class StreamingDownloadManager(
                     val n = nonZeroIn(path, offset)
                     if (n > 0) {
                         lastNonZero = n
-                        s.confirmedEnd = maxOf(s.confirmedEnd, offset + PROBE_BYTES)
+                        // 只登记"这一段真的可读"，绝不外扩到其他偏移
+                        s.markReadable(offset, offset + PROBE_BYTES)
                         PlaybackDiag.probe(offset, polls, n, SystemClock.elapsedRealtime() - t0, "disk")
                         return
                     }
@@ -666,7 +721,7 @@ class StreamingDownloadManager(
     fun readableBytesFrom(fileId: Int, pos: Long): Long {
         val s = sessions[fileId] ?: return 0L
         if (s.completed.value) return Long.MAX_VALUE / 4
-        return (s.confirmedEnd - pos).coerceAtLeast(0L)
+        return s.readableFrom(pos)
     }
 
     /** 读 [pos] 起的 [PROBE_BYTES] 字节，返回非零字节数（0 = 空洞或不可读）。 */
@@ -707,7 +762,7 @@ class StreamingDownloadManager(
         val completed = (local["is_downloading_completed"] as? JsonPrimitive)?.booleanOrNull == true
         if (completed && !s.completed.value) {
             s.completed.value = true
-            s.confirmedEnd = Long.MAX_VALUE / 4
+            s.markReadable(0L, Long.MAX_VALUE / 4)
             s.readable.value = Long.MAX_VALUE / 4   // 整文件可读，全部 waiter 放行
             promoteToLru(s)
             return
@@ -717,7 +772,7 @@ class StreamingDownloadManager(
             s.awaitingBaseline = false
             val p0 = (local["downloaded_prefix_size"] as? JsonPrimitive)?.longOrNull ?: 0L
             s.readable.value = p0
-            if (s.base >= 0L && p0 > 0L) s.confirmedEnd = maxOf(s.confirmedEnd, s.base + p0)
+            if (s.base >= 0L && p0 > 0L) s.markReadable(s.base, s.base + p0)
             return
         }
         if (s.awaitingBaseline) return   // 新请求基线建立前：旧引用 update 一律丢弃
@@ -727,7 +782,7 @@ class StreamingDownloadManager(
         // 单事件增量钳制：防止基线错位/串台注入虚假大前缀（防呆上限 8MB/事件）
         s.readable.update { cur -> if (prefix > cur) min(prefix, cur + MAX_PREFIX_JUMP) else cur }
         // 单请求模型下前缀不再有多窗口歧义：同步推进磁盘真值水位（零 IO 快路径）
-        if (s.base >= 0L) s.confirmedEnd = maxOf(s.confirmedEnd, s.base + s.readable.value)
+        if (s.base >= 0L) s.markReadable(s.base, s.base + s.readable.value)
     }
 
     // ═══════════════════════ LRU 缓存 ═══════════════════════

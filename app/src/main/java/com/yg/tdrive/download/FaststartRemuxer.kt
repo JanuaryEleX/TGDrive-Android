@@ -48,16 +48,22 @@ object FaststartRemuxer {
     private const val TAG = "Faststart"
 
     /**
-     * 允许做 faststart 重排的文件大小上限。
-     * 超过此值的文件直接顺序流播（moov-at-tail 首播失败 → UI 提示完整下载）。
+     * 「尾部 8MB 盲扫」回退方案的文件大小上限（header 链正常时不受此限）。
+     * 大文件盲扫代价过高，宁可直接顺序流播。
      */
     const val FASTSTART_MAX_BYTES = 300L * 1024 * 1024
 
     /** prepare 阶段规划硬上限：超时即放弃重排，退回 TdDataSource 直连。 */
     private const val PREPARE_PLAN_TIMEOUT_MS = 15_000L
 
+    /** 大文件规划上限：要多下 moov（几 MB）才能重排，给更长的窗口。 */
+    private const val LARGE_PREPARE_TIMEOUT_MS = 60_000L
+
     /** box header 读取长度（size(4) + type(4) + 可选 largesize(8)）。 */
     private const val HEADER_BYTES = 16L
+
+    /** readReal 的单次确认块大小（≥ 探针粒度，避免读到未落盘空洞）。 */
+    private const val READ_CHUNK_BYTES = 512L * 1024
 
     /** header 链最多跳数（防止损坏文件把 size 读成 1 造成死循环/长链）。 */
     private const val MAX_BOX_HOPS = 64
@@ -108,18 +114,18 @@ object FaststartRemuxer {
             PlaybackDiag.plan("direct", "size_unknown")
             return null
         }
-        if (size > FASTSTART_MAX_BYTES) {
-            // 方案 B：大文件不在唯一游标上抢尾部，直接顺序流播。
-            PlaybackDiag.plan("direct", "too_large size=$size > $FASTSTART_MAX_BYTES")
-            Log.i(TAG, "file=$fileId size=$size 超过 ${FASTSTART_MAX_BYTES / 1024 / 1024}MB，跳过重排")
-            return null
-        }
+        // 大文件同样走 header 链：链式跳读只需 16 字节/跳，尾部代价只是 moov 本身，
+        // 远比"让解析器自己去尾部找 moov"便宜。反之若不做重排，Mp4Extractor 会为了
+        // 读 moov 去 seek 文件尾，把唯一下载游标反复拽来拽去（实测 1.7GB 文件 10 次重定位），
+        // 播放永远起不来。只有"尾部 8MB 盲扫"这种昂贵回退才按大小设限。
+        val allowTailScan = size <= FASTSTART_MAX_BYTES
+        val timeoutMs = if (size > FASTSTART_MAX_BYTES) LARGE_PREPARE_TIMEOUT_MS else PREPARE_PLAN_TIMEOUT_MS
 
         val t0 = SystemClock.elapsedRealtime()
         var outcome: Outcome? = null
-        val finished = withTimeoutOrNull(PREPARE_PLAN_TIMEOUT_MS) {
+        val finished = withTimeoutOrNull(timeoutMs) {
             outcome = try {
-                buildInner(mgr, fileId, size)
+                buildInner(mgr, fileId, size, allowTailScan)
             } catch (ce: CancellationException) {
                 throw ce
             } catch (t: Throwable) {
@@ -131,7 +137,7 @@ object FaststartRemuxer {
         if (finished == null) {
             // 超时：prepare 阶段遗留的尾部请求必须收掉，交棒 TdDataSource 前保持游标干净。
             val ms = SystemClock.elapsedRealtime() - t0
-            PlaybackDiag.plan("timeout", "prepare>${PREPARE_PLAN_TIMEOUT_MS}ms (${ms}ms)")
+            PlaybackDiag.plan("timeout", "prepare>${timeoutMs}ms (${ms}ms)")
             Log.w(TAG, "file=$fileId 规划超时（${ms}ms），退回直连")
             runCatching { mgr.abortPending(fileId) }
             return null
@@ -157,6 +163,7 @@ object FaststartRemuxer {
         mgr: StreamingDownloadManager,
         fileId: Int,
         size: Long,
+        allowTailScan: Boolean,
     ): Outcome {
         val chain = ArrayList<String>(8)
         var pos = 0L
@@ -202,8 +209,12 @@ object FaststartRemuxer {
         if (moov == null) {
             if (broken) {
                 // header 链断裂 → 回退旧策略（拉尾部 8MB 搜签名）
-                Log.w(TAG, "header 链断裂，回退尾部扫描 file=$fileId")
-                return trailingScan(mgr, fileId, size)
+                if (allowTailScan) {
+                    Log.w(TAG, "header 链断裂，回退尾部扫描 file=$fileId")
+                    return trailingScan(mgr, fileId, size)
+                }
+                Log.w(TAG, "header 链断裂且文件过大（$size），不回退尾部盲扫 file=$fileId")
+                return Outcome(null, "chain_broken size=$size")
             }
             return Outcome(null, "moov_not_after_mdat")
         }
@@ -391,7 +402,10 @@ object FaststartRemuxer {
 
     /**
      * 从真实文件读一段（经由 StreamingDownloadManager 落盘窗口）。
-     * 要求整段已落盘（含末尾），否则 moov 尾部会是 TDLib 预分配的全零。
+     *
+     * 必须**逐块** ensureRange(requireEnd=true)：探针确认粒度是 64KB，一次要整段
+     * （moov 常见几 MB）会把中间未落盘、TDLib 预分配的全零空洞一起读出来，
+     * 进而把零当 chunk offset 表解析 → 花屏或 "Loading finished before preparation"。
      */
     private suspend fun readReal(
         mgr: StreamingDownloadManager,
@@ -399,17 +413,24 @@ object FaststartRemuxer {
         offset: Long,
         length: Long,
     ): ByteArray {
-        val ref = mgr.ensureRange(fileId, offset, length, tag = "prepare", requireEnd = true)
         val out = ByteArray(length.toInt())
-        RandomAccessFile(ref.partialPath, "r").use { raf ->
-            raf.seek(offset - ref.globalOffset)
-            var got = 0
-            while (got < out.size) {
-                val n = raf.read(out, got, out.size - got)
-                if (n <= 0) break
+        var got = 0
+        var cur = offset
+        while (got < out.size) {
+            val chunk = minOf((out.size - got).toLong(), READ_CHUNK_BYTES)
+            val ref = mgr.ensureRange(fileId, cur, chunk, tag = "prepare", requireEnd = true)
+            RandomAccessFile(ref.partialPath, "r").use { raf ->
+                raf.seek(cur - ref.globalOffset)
+                var n = 0
+                while (n < chunk) {
+                    val r = raf.read(out, got + n, (chunk - n).toInt())
+                    if (r <= 0) break
+                    n += r
+                }
                 got += n
+                if (n.toLong() < chunk) return out.copyOf(got)
             }
-            if (got != out.size) return out.copyOf(got)
+            cur += chunk
         }
         return out
     }

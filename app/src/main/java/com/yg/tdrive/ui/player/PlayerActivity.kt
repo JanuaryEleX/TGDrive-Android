@@ -352,7 +352,7 @@ class PlayerActivity : ComponentActivity() {
                 .build()
             // moov 在文件尾的 MP4：先做 faststart 虚拟重排（IO 线程），否则 Mp4Extractor
             // 会 seek 到尾部读 moov 并把采样偏移二次叠加 → 越界 EOF。
-            // build 内部有 15s 硬上限 + 大小分流，超时/过大一律返回 null → TdDataSource 直连。
+            // build 内部有硬上限（小文件 15s / 大文件 60s），超时或链式解析失败才返回 null → TdDataSource 直连。
             val plan = if (entity.size > 0L) {
                 withContext(Dispatchers.IO) {
                     FaststartRemuxer.build(ServiceLocator.downloadManager, fileId, entity.size)
@@ -369,8 +369,8 @@ class PlayerActivity : ComponentActivity() {
                 TdVirtualDataSourceFactory(ServiceLocator.downloadManager, plan)
             } else {
                 PlaybackDiag.source("td_data")
-                // 大文件（> FASTSTART_MAX_BYTES）不做重排：moov 在文件尾时首播必然失败，
-                // 明确告知用户并给离线下载入口，而不是让人对着黑屏等。
+                // 极少数重排失败的超大文件（链断裂）才提示完整下载；
+                // 常规大文件已能重排，不该再弹这个提示。
                 needsFullDownload.value =
                     entity.size > FaststartRemuxer.FASTSTART_MAX_BYTES &&
                     entity.mime?.contains("mp4", ignoreCase = true) != false

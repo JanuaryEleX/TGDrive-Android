@@ -79,8 +79,17 @@ class TdVirtualDataSource(
             val chunkLen = minOf(remaining.toLong(), limitReal - real).coerceAtLeast(1L)
             val ref = ensure(real, maxOf(chunkLen, PREHEAT))
             val handle = handleFor(ref)
+            val fileLen = File(ref.partialPath).length()
             handle.seek(real - ref.globalOffset)
-            val n = handle.read(buffer, bufOff, chunkLen.toInt())
+            // TDLib partial 是预分配稀疏文件：长度够 ≠ 数据已落盘。必须按「连续已确认
+            // 字节数」钳制本次 read，否则会把空洞里的全零当码流交给解码器（花屏/解析失败）。
+            val safe = mgr.readableBytesFrom(plan.fileId, real)
+            val toRead = minOf(
+                chunkLen,
+                safe.coerceAtLeast(1L),
+                ref.globalOffset + fileLen - real,
+            ).coerceAtLeast(1L).toInt()
+            val n = handle.read(buffer, bufOff, toRead)
             if (n <= 0) {
                 if (total == 0) throw IOException("虚拟读取 EOF file=${plan.fileId} vpos=$position real=$real")
                 break
