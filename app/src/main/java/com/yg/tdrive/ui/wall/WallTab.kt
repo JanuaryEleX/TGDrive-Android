@@ -794,12 +794,10 @@ internal fun PosterCell(
         ) {
             // 解码尺寸按列数/屏幕宽度实时算：三列每格更小，按原图或固定 400px 解码
             // 会让 UI 线程在滚动时忙于 Bitmap 分配（实测三列中位帧耗时 44ms）。
+            val config = LocalConfiguration.current
             val density = LocalDensity.current.density
-            val screenWidthDp = LocalConfiguration.current.screenWidthDp
             val ctx = LocalContext.current
-            val posterPx = remember(columns, screenWidthDp, density) {
-                PosterSizing.decodePx(screenWidthDp, columns, density)
-            }
+            val posterPx = PosterSizing.decodePx(config.screenWidthDp, columns, density)
             // ImageRequest 必须在 composition 外构建一次：每次重组 new 一个 Builder
             // 会让 Coil 认为请求变了，反复重建、丢弃缓存键。
             val posterModel = remember(m.thumbPath, posterPx) {
