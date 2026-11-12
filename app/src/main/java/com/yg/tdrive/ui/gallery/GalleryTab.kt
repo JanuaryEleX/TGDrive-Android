@@ -170,7 +170,9 @@ fun GalleryTab() {
         }
 
         when {
-            items.loadState.refresh is LoadState.Loading -> {
+            // 同 WallGrid：扫描期间 Room 写库会反复 invalidate PagingSource，
+            // 只有真正空库时才显示骨架屏，避免列表被反复顶掉造成屏闪。
+            items.loadState.refresh is LoadState.Loading && items.itemCount == 0 -> {
                 ImageSkeletonGrid()
             }
             items.itemCount == 0 -> {

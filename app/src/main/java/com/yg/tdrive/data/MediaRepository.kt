@@ -1014,7 +1014,9 @@ class MediaRepository(
         val job = scope.launch(Dispatchers.IO) {
             thumbSemaphore.withPermit {
                 val path = downloadThumbnail(entity.fileUniqueId, thumbFile)
-                if (path != null) mediaDao.updateThumbPath(entity.id, path)
+                // 幂等写：值未变化就不 UPDATE，避免扫描期间每次封面落盘都
+                // invalidate 一次 PagingSource（UI 层会表现为列表反复重建/屏闪）。
+                if (path != null) mediaDao.updateThumbPathIfChanged(entity.id, path)
             }
         }
         thumbJobs.add(job)

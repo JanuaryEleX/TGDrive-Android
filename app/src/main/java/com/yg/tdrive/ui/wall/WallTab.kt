@@ -560,7 +560,10 @@ private fun DriveChip(label: String, selected: Boolean, onClick: () -> Unit) {
 private fun WallGrid(items: LazyPagingItems<MediaEntity>, onInfo: (MediaEntity) -> Unit) {
     val context = LocalContext.current
     when {
-        items.loadState.refresh is LoadState.Loading -> {
+        // 扫描/补封面期间 Room 每次写库都会 invalidate PagingSource，
+        // loadState.refresh 反复回到 Loading。只在「确实没有数据」时显示骨架屏，
+        // 否则列表会被骨架屏顶掉再重建，表现为持续屏闪。
+        items.loadState.refresh is LoadState.Loading && items.itemCount == 0 -> {
             PosterSkeletonGrid()
         }
         items.itemCount == 0 -> {
