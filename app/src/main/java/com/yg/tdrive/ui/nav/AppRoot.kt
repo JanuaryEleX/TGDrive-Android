@@ -1,5 +1,6 @@
 package com.yg.tgdrive.ui.nav
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
@@ -38,11 +39,18 @@ fun AppRoot() {
             // 首次引导：屏蔽返回键，防误触退出向导（OnboardingFlow 内部也屏蔽）
             OnboardingFlow(onFinished = { route = Routes.HOME })
         }
-        Routes.SETTINGS -> SettingsScreen(
-            onBack = { route = Routes.HOME },
-        )
-        Routes.SEARCH -> SearchScreen(onBack = { route = Routes.HOME })
-        Routes.DOWNLOAD -> DownloadScreen(onBack = { route = Routes.HOME })
+        Routes.SETTINGS -> {
+            BackHandler { route = Routes.HOME }
+            SettingsScreen(onBack = { route = Routes.HOME })
+        }
+        Routes.SEARCH -> {
+            BackHandler { route = Routes.HOME }
+            SearchScreen(onBack = { route = Routes.HOME })
+        }
+        Routes.DOWNLOAD -> {
+            BackHandler { route = Routes.HOME }
+            DownloadScreen(onBack = { route = Routes.HOME })
+        }
         else -> MainScreen(
             onOpenSettings = { route = Routes.SETTINGS },
             onOpenSearch = { route = Routes.SEARCH },
