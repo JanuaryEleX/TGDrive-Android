@@ -404,10 +404,10 @@ class MediaRepository(
                 val albumId = msg["media_album_id"]?.jsonPrimitive?.longOrNull
                     ?.takeIf { it != 0L } ?: continue
                 if (containsKey(albumId)) continue
-                val cap = msg["caption"]?.jsonObject
-                    ?.get("text")?.jsonObject
-                    ?.get("text")?.jsonPrimitive?.contentOrNull
-                    ?.let { sanitizeCaption(it) }
+                // TDLib 的 caption 不是 message 顶层字段，而是挂在 content 的媒体对象上
+                // （video.caption / photo.caption = formattedText{text}）；相册里通常
+                // 只有其中一条带描述，所以要跨整组消息汇总。
+                val cap = captionOf(msg)?.let { sanitizeCaption(it) }
                 if (!cap.isNullOrBlank()) put(albumId, cap)
             }
         }
@@ -891,6 +891,20 @@ class MediaRepository(
             .trim()
         if (flat.isEmpty()) return ""
         return if (flat.length > 120) flat.take(120).trimEnd() else flat
+    }
+
+    /** 取消息的相册/媒体描述正文：caption 挂在 content 的媒体对象上（formattedText.text）。 */
+    private fun captionOf(msg: JsonObject): String? {
+        val content = msg["content"] as? JsonObject ?: return null
+        val media = when ((content["@type"] as? JsonPrimitive)?.content) {
+            "messageVideo" -> content["video"]
+            "messagePhoto" -> content["photo"]
+            "messageDocument" -> content["document"]
+            "messageAnimation" -> content["animation"]
+            else -> null
+        } as? JsonObject ?: return null
+        val ft = media["caption"] as? JsonObject ?: return null
+        return (ft["text"] as? JsonPrimitive)?.content
     }
 
     /**
