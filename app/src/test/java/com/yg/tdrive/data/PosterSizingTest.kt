@@ -1,4 +1,4 @@
-package com.yg.tdrive.ui.wall
+package com.yg.tdrive.data
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
