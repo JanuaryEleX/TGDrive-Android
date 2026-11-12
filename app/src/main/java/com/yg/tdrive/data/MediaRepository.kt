@@ -710,6 +710,7 @@ class MediaRepository(
         var pages = 0
         var captioned = 0
         var capDiagSamples = 0
+        val capDiag = StringBuilder()
         val drives = withContext(Dispatchers.IO) { driveDao.getAll() }
         for (drive in drives) {
             var fromMessageId = 0L
@@ -740,16 +741,17 @@ class MediaRepository(
                 }
                 // 诊断：统计本页有多少条消息真带 caption，以及前几条的原始结构。
                 // 目的：历史数据 0 改名时，区分「描述根本不在返回里」和「解析/写库出错」。
+                // 走文件而不是 logcat：这台机器上 logcat 读不到本应用的日志。
                 for (msg in messages) {
                     val ct = ((msg["content"] as? JsonObject)?.get("@type") as? JsonPrimitive)?.content ?: "?"
                     val rawCap = captionOf(msg)
                     if (!rawCap.isNullOrBlank()) captioned++
                     if (capDiagSamples < 6) {
                         capDiagSamples++
-                        Log.i(
-                            TAG,
-                            "CAPDIAG type=$ct album=${msg["media_album_id"]?.jsonPrimitive?.longOrNull}" +
-                                " capLen=${rawCap?.length ?: -1} cap=${rawCap?.take(40)}",
+                        val keys = (msg["content"] as? JsonObject)?.keys?.joinToString(",") ?: "-"
+                        capDiag.append(
+                            "type=$ct album=${msg["media_album_id"]?.jsonPrimitive?.longOrNull}" +
+                                " capLen=${rawCap?.length ?: -1} cap=${rawCap?.take(50)} keys=$keys\n",
                         )
                     }
                 }
@@ -772,6 +774,14 @@ class MediaRepository(
                 }
                 pages++
                 onProgress(pages, renamed)
+                // 每页落盘一次：回填耗时长，中途也能看到进度与样本
+                appContext?.let { ctx ->
+                    runCatching {
+                        File(ctx.filesDir, "caption-diag.txt").writeText(
+                            "页数=$pages 改名行数=$renamed 带描述消息=$captioned\n$capDiag",
+                        )
+                    }
+                }
                 val lastId = messages.last()["id"]?.jsonPrimitive?.longOrNull ?: break
                 if (lastId == 0L) break
                 if (messages.size < SCAN_PAGE_SIZE) {
@@ -785,7 +795,12 @@ class MediaRepository(
                 delay(PAGE_DELAY_MS)
             }
         }
-        Log.i(TAG, "描述改名回填完成: 页数=$pages 改名行数=$renamed 带描述消息=$captioned")
+        val summary = "页数=$pages 改名行数=$renamed 带描述消息=$captioned\n$capDiag"
+        Log.i(TAG, "描述改名回填完成: $summary")
+        appContext?.let { ctx ->
+            runCatching { File(ctx.filesDir, "caption-diag.txt").writeText(summary) }
+                .onFailure { Log.w(TAG, "写 caption-diag.txt 失败", it) }
+        }
         return renamed
     }
 
