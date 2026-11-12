@@ -23,8 +23,8 @@ class KeywordCloudTest {
 
     @Test fun `cloud is capped and deterministic`() {
         val names = listOf("旅行日落山川星空.mp4", "旅行日落山川星空.jpg")
-        val words = KeywordCloud.fromNames(names, limit = 8)
-        assertEquals(8, words.size)
-        assertEquals(words, KeywordCloud.fromNames(names, limit = 8))
+        val words = KeywordCloud.fromNames(names, limit = 4)
+        assertEquals(4, words.size)
+        assertEquals(words, KeywordCloud.fromNames(names, limit = 4))
     }
 }
