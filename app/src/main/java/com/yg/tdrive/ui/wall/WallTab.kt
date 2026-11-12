@@ -899,19 +899,22 @@ internal fun PosterCell(
                 modifier = Modifier.fillMaxSize(),
             )
 
-            // 底部极轻渐变，只为托住时长胶囊，不压暗画面
-            Box(
-                Modifier
-                    .align(Alignment.BottomCenter)
-                    .fillMaxWidth()
-                    .height(46.dp)
-                    .background(
-                        Brush.verticalGradient(
-                            0f to Color.Transparent,
-                            1f to Color.Black.copy(alpha = 0.6f),
-                        )
-                    ),
-            )
+            // 三列同时可见的格子更多，省掉每张海报单独的渐变绘制。
+            // 时长胶囊有自己的深色底，三列仍然清晰且可交互。
+            if (com.yg.tdrive.data.PosterRenderPolicy.decoration(columns).drawGradient) {
+                Box(
+                    Modifier
+                        .align(Alignment.BottomCenter)
+                        .fillMaxWidth()
+                        .height(46.dp)
+                        .background(
+                            Brush.verticalGradient(
+                                0f to Color.Transparent,
+                                1f to Color.Black.copy(alpha = 0.6f),
+                            )
+                        ),
+                )
+            }
 
             val dur = formatDuration(m.durationMs)
             if (dur.isNotEmpty()) {
