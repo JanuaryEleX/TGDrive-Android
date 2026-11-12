@@ -2,6 +2,7 @@ package com.yg.tgdrive.download
 
 import android.os.SystemClock
 import android.util.Log
+import com.yg.tgdrive.data.SeekRelocationPolicy
 import com.yg.tgdrive.data.TdRequestException
 import com.yg.tgdrive.data.tdCall
 import com.yg.tgdrive.td.TdClient
@@ -77,13 +78,6 @@ class StreamingDownloadManager(
 
         /** 等落盘整体超时（单个区间）。 */
         private const val WAIT_TIMEOUT_MS = 60_000L
-
-        /**
-         * 顺序下载的"前视窗口"：目标位置超出「已落盘水位 + 该值」就判定为跳跃 seek，
-         * 需要取消在飞请求并重定位。取值要大于正常播放的缓冲需求（几 MB），
-         * 又要小到能让拖动及时生效。
-         */
-        private const val SEEK_LOOKAHEAD_BYTES = 16L * 1024 * 1024
 
         /**
          * 探针读取窗口 = 单次 read 的落盘确认粒度。任意非零字节即视为该窗口已落盘，
@@ -286,12 +280,17 @@ class StreamingDownloadManager(
         try {
             s.mutex.withLock {
                 if (s.abandoned) throw DownloadException("file $fileId 会话已取消")
+                val needLen = spanLen(offset, need, expected)
                 // 单请求：只有"游标真需要移动"时才发新请求。
                 // 顺序播放时位置单调前进且落在已请求区间之后 → 让在飞的那条 limit=0 请求
                 // 继续从 base 顺序下到文件尾，**一次都不重发**（重发会让 TDLib 反复重置游标、
                 // 掉速，是旧版「几秒后有速度然后归零」的成因之一）。
-                if (needsNewRequest(s, aligned)) sendDownload(s, aligned, tag)
-                awaitDataLocked(s, offset, spanLen(offset, need, expected), tag)
+                // 已落盘区间（账本连续覆盖）不再发起请求：否则往回拖到已缓存位置也会
+                // 白取消一次在飞下载，造成无谓的重置与掉速。
+                if (s.readableFrom(offset) < needLen && needsNewRequest(s, aligned)) {
+                    sendDownload(s, aligned, tag)
+                }
+                awaitDataLocked(s, offset, needLen, tag)
                 if (requireEnd) {
                     // 需要整段可读（moov 本体）：再确认区间末尾也已落盘，
                     // 否则 TDLib 预分配的全零尾巴会让 moov 解析失败。
@@ -622,13 +621,11 @@ class StreamingDownloadManager(
      */
     private fun needsNewRequest(s: FileSession, aligned: Long): Boolean {
         if (s.failure != null) return true        // 上一条失败（被取消/网络错）→ 重发
-        if (s.base < 0L) return true              // 还没发过
-        // 往回拖：目标已在已下载区间之前，顺序游标不会回头 → 必须重定位
-        if (aligned < s.base) return true
-        // 向前拖：看是否落在顺序下载的前视窗口内
-        val watermark = maxOf(s.confirmedEnd, if (s.base > 0L) s.base + s.readable.value else s.readable.value)
-        val ahead = aligned - watermark
-        return ahead > SEEK_LOOKAHEAD_BYTES
+        return SeekRelocationPolicy.needsRelocation(
+            base = s.base,
+            prefix = s.readable.value,
+            target = aligned,
+        )
     }
 
     /** TDLib 的「被另一个 downloadFile 取消」（code 200 + Canceled）判定。 */
@@ -731,7 +728,21 @@ class StreamingDownloadManager(
             raf.seek(pos)
             val buf = ByteArray(PROBE_BYTES)
             val n = raf.read(buf)
-            if (n <= 0) 0 else buf.count { it.toInt() != 0 }
+            if (n <= 0) {
+                0
+            } else {
+                var nonZero = 0
+                var allFF = true
+                for (i in 0 until n) {
+                    val b = buf[i].toInt() and 0xFF
+                    if (b != 0) nonZero++
+                    if (b != 0xFF) allFF = false
+                }
+                // 真机实测（temp/2627）：TDLib 某些未落盘区域被预填成 0xFF 而不是 0。
+                // 「有非零字节 = 已落盘」的判据会被这种填充骗过，把填充当数据交出去。
+                // 整窗全 0xFF 一律按空洞处理。
+                if (allFF) 0 else nonZero
+            }
         }
     }.getOrDefault(0)
 
