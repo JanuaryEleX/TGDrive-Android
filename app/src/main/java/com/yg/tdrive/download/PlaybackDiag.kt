@@ -66,6 +66,7 @@ object PlaybackDiag {
 
     // ── 明细行 ──
     private val ensureRows = mutableListOf<JsonObject>()
+    private val fileRows = mutableListOf<JsonObject>()
     private val fetchRows = mutableListOf<JsonObject>()
     private val probeRows = mutableListOf<JsonObject>()
     private val events = mutableListOf<JsonObject>()
@@ -86,6 +87,10 @@ object PlaybackDiag {
 
     private val json = kotlinx.serialization.json.Json { prettyPrint = true }
 
+    /** 是否有正在进行的播放取证轮次（begin 之后、finish 之前）。 */
+    @Volatile var isRecording = false
+        private set
+
     private fun now() = SystemClock.elapsedRealtime()
 
     /** 新一轮准备开始（同一 Activity 内切集时重置）。 */
@@ -105,6 +110,7 @@ object PlaybackDiag {
             planVirtualSize = -1L
             source = "none"
             ensureRows.clear()
+            fileRows.clear()
             fetchRows.clear()
             probeRows.clear()
             events.clear()
@@ -116,6 +122,7 @@ object PlaybackDiag {
             maxLivePerFile.clear()
         }
         Log.i(TAG, "begin media=$mediaId file=$fileId size=$size")
+        isRecording = true
     }
 
     /** 关键节点（prepare 计时锚点）。 */
@@ -241,6 +248,44 @@ object PlaybackDiag {
         )
     }
 
+    /**
+     * 一次「TDLib 自报状态 x 磁盘真值」取证行。
+     * completed / prefix 是 TDLib DB 的自报口径，diskLen 是文件系统真值；
+     * 二者不一致（diskLen=-1 缺失、diskLen=0 空文件）就是「读出来全是零」的根因。
+     */
+    fun fileState(
+        fileId: Int,
+        completed: Boolean,
+        prefix: Long,
+        base: Long,
+        confirmedEnd: Long,
+        expectedSize: Long,
+        path: String?,
+        diskLen: Long,
+        note: String,
+    ) {
+        synchronized(this) {
+            if (fileRows.size < MAX_ROWS) {
+                fileRows.add(buildJsonObject {
+                    put("fileId", fileId)
+                    put("completed", completed)
+                    put("prefix", prefix)
+                    put("base", base)
+                    put("confirmedEnd", confirmedEnd)
+                    put("expectedSize", expectedSize)
+                    put("path", path ?: "")
+                    put("diskLen", diskLen)
+                    put("note", note)
+                })
+            } else {
+                bump("fileStates")
+            }
+        }
+        if (note.isNotBlank()) {
+            Log.w(TAG, "fileState file=$fileId $note (disk=$diskLen prefix=$prefix completed=$completed p=$path)")
+        }
+    }
+
     /** probeNonZero 收尾：polls = 轮询次数，nonzero = 实际读到的非零字节数。 */
     fun probe(offset: Long, polls: Int, nonzero: Int, ms: Long, outcome: String) {
         synchronized(this) {
@@ -298,6 +343,7 @@ object PlaybackDiag {
 
     /** 写 `<filesDir>/play-diag.json`；context 为 null 只打日志。 */
     suspend fun finish(context: Context?): File? = withContext(NonCancellable + Dispatchers.IO) {
+        isRecording = false
         if (context == null) {
             Log.w(TAG, "appContext == null，跳过 $FILE_NAME")
             return@withContext null
@@ -345,6 +391,7 @@ object PlaybackDiag {
                         },
                     )
                     put("ensureRanges", buildJsonArray { ensureRows.forEach { add(it) } })
+                    put("fileStates", buildJsonArray { fileRows.forEach { add(it) } })
                     put("fetches", buildJsonArray { fetchRows.forEach { add(it) } })
                     put("probes", buildJsonArray { probeRows.forEach { add(it) } })
                     put("events", buildJsonArray { events.forEach { add(it) } })

@@ -163,6 +163,9 @@ class StreamingDownloadManager(
 
         /** 上层已放弃本会话（cancelAll 硬取消）：updateFile/applyFileState 不再复活。 */
         @Volatile var abandoned = false
+
+        /** 正在做「TDLib 自报状态 x 磁盘真值」修正，防止递归重入。 */
+        @Volatile var resetting = false
     }
 
     // ═══════════════════════ 生命周期 ═══════════════════════
@@ -208,6 +211,8 @@ class StreamingDownloadManager(
         val need = if (len <= 0) 1L else len
         val s = session(fileId)
         ensureSnapshot(s)
+        // TDLib 自报「已完成/有前缀」而磁盘没数据时，先清掉陈旧记录，避免把零字节交给解析器
+        verifyLocalState(s)
 
         // ① LRU 命中：完整缓存文件直接读，零 TDLib 调用
         s.uniqueId?.let { uid ->
@@ -336,6 +341,9 @@ class StreamingDownloadManager(
         val s = session(fileId)
         ensureSnapshot(s)
         if (!s.completed.value) return null
+        // 自报完成但文件其实没了 → 清掉陈旧记录，交给流播重新下载
+        verifyLocalState(s)
+        if (!s.completed.value) return null
         val path = s.partialPath.value ?: return null
         val f = File(path)
         return if (f.isFile && f.length() > 0L) f else null
@@ -386,6 +394,92 @@ class StreamingDownloadManager(
 
     private fun session(fileId: Int): FileSession =
         sessions.getOrPut(fileId) { FileSession(fileId) }
+
+    /** TDLib 本地文件磁盘真值长度；不存在 / 非普通文件返回 -1。 */
+    private fun diskLength(path: String?): Long {
+        if (path.isNullOrBlank()) return -1L
+        val f = File(path)
+        return if (f.isFile) f.length() else -1L
+    }
+
+    /**
+     * TDLib DB 的本地状态可能与磁盘不符：换机恢复数据、清过缓存、partial 被删之后，
+     * `is_downloading_completed=true` / `downloaded_prefix_size>0` 仍然留着。
+     * 此时若按自报状态放行，[TdDataSource] 会把**整片零字节**交给 Mp4Extractor →
+     * 解析出垃圾 box 尺寸（实测 seek 到 819MB，远超文件大小）→ 永远 prepare 不出来。
+     *
+     * 因此每次进入 ensureRange 先做一次交叉校验；发现不符就 deleteFile 让 TDLib
+     * 清掉本地记录并重新下载（云端只读、无副作用）。
+     */
+    private suspend fun verifyLocalState(s: FileSession) {
+        if (s.resetting) return
+        val path = s.partialPath.value
+        val disk = diskLength(path)
+        val expected = s.expectedSize
+        val completed = s.completed.value
+        val prefix = s.readable.value
+        if (disk < 0L) {
+            if (completed || prefix > 0L) {
+                resetStaleLocal(s, "文件缺失（completed=$completed prefix=$prefix path=$path）", disk)
+            }
+            return
+        }
+        if (disk == 0L && (completed || prefix > 0L)) {
+            resetStaleLocal(s, "空文件（completed=$completed prefix=$prefix path=$path）", disk)
+            return
+        }
+        if (completed && expected > 0L && disk < expected) {
+            resetStaleLocal(s, "标记完成但落盘不全（disk=$disk expected=$expected）", disk)
+            return
+        }
+        if (PlaybackDiag.isRecording) {
+            PlaybackDiag.fileState(
+                fileId = s.fileId,
+                completed = completed,
+                prefix = prefix,
+                base = s.base,
+                confirmedEnd = s.confirmedEnd,
+                expectedSize = expected,
+                path = path,
+                diskLen = disk,
+                note = "",
+            )
+        }
+    }
+
+    /** 陈旧本地状态 → 删掉 TDLib 本地记录并清空会话，让它从云端重新下载。 */
+    private suspend fun resetStaleLocal(s: FileSession, why: String, disk: Long) {
+        s.resetting = true
+        try {
+            PlaybackDiag.fileState(
+                fileId = s.fileId,
+                completed = s.completed.value,
+                prefix = s.readable.value,
+                base = s.base,
+                confirmedEnd = s.confirmedEnd,
+                expectedSize = s.expectedSize,
+                path = s.partialPath.value,
+                diskLen = disk,
+                note = "STALE: $why",
+            )
+            Log.w(TAG, "file ${s.fileId} 本地状态与磁盘不符 → deleteFile 重下：$why")
+            runCatching { tdLong(tdObj("@type" to "deleteFile", "file_id" to s.fileId)) }
+                .onFailure { Log.w(TAG, "deleteFile ${s.fileId} failed: ${it.message}") }
+            s.completed.value = false
+            s.readable.value = 0L
+            s.confirmedEnd = 0L
+            s.downloadedSize = 0L
+            s.base = -1L
+            s.partialPath.value = null
+            s.expectedSize = 0L
+            s.snapshotted = false
+            s.awaitingBaseline = true
+            s.failure = null
+            PlaybackDiag.event("stale-local", "file ${s.fileId} $why")
+        } finally {
+            s.resetting = false
+        }
+    }
 
     /**
      * 下载层 TD 调用统一走长超时：非同步 downloadFile 会立即返回，但代理慢时

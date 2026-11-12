@@ -1,0 +1,12 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- 仅 debug 构建：把播放页导出，便于 adb 直接拉起指定 mediaId 做运行时点验。
+         正式包不受影响。 -->
+    <application>
+        <activity
+            android:name=".ui.player.PlayerActivity"
+            android:exported="true"
+            tools:replace="android:exported" />
+    </application>
+</manifest>
