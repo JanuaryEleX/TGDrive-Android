@@ -104,7 +104,7 @@ fun MainScreen(
             verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(start = 18.dp, end = 10.dp, top = 10.dp, bottom = 8.dp),
+                .padding(start = 18.dp, end = 10.dp, top = 4.dp, bottom = 4.dp),
         ) {
             Column(Modifier.weight(1f)) {
                 Text(
@@ -113,7 +113,7 @@ fun MainScreen(
                         1 -> "视频"
                         else -> "图片"
                     },
-                    style = MaterialTheme.typography.headlineSmall,
+                    style = MaterialTheme.typography.titleLarge,
                     color = MaterialTheme.colorScheme.onBackground,
                 )
                 Text(
@@ -122,7 +122,7 @@ fun MainScreen(
                         1 -> "海报墙"
                         else -> "图片流"
                     },
-                    style = MaterialTheme.typography.bodySmall,
+                    style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
@@ -224,10 +224,11 @@ fun MainScreen(
             }
         }
 
-        // ---- 底部三 tab ----
+        // ---- 底部三 tab（紧凑高度：默认 80dp 偏高，压到 56dp）----
         NavigationBar(
             containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
             tonalElevation = 0.dp,
+            modifier = Modifier.height(56.dp),
         ) {
             val items = listOf(
                 Triple("最近", AppIcons.History, 0),
@@ -242,13 +243,13 @@ fun MainScreen(
                         androidx.compose.material3.Icon(
                             icon,
                             contentDescription = null,
-                            modifier = Modifier.size(22.dp),
+                            modifier = Modifier.size(20.dp),
                         )
                     },
                     label = {
                         Text(
                             label,
-                            fontSize = 11.sp,
+                            fontSize = 10.sp,
                             fontWeight = if (tab == index) FontWeight.SemiBold else FontWeight.Normal,
                         )
                     },
@@ -324,7 +325,7 @@ private fun RecentGrid(items: LazyPagingItems<MediaEntity>) {
     val context = LocalContext.current
     var detailFor by remember { mutableStateOf<MediaEntity?>(null) }
     if (items.loadState.refresh is LoadState.Loading && items.itemCount == 0) {
-        PosterSkeletonGrid()
+        PosterSkeletonGrid(2)
         return
     }
     if (items.itemCount == 0) {
@@ -336,10 +337,10 @@ private fun RecentGrid(items: LazyPagingItems<MediaEntity>) {
         return
     }
     LazyVerticalGrid(
-        columns = GridCells.Fixed(columns),
+        columns = GridCells.Fixed(2),
         contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 16.dp),
-        horizontalArrangement = Arrangement.spacedBy(if (columns >= 3) 9.dp else 12.dp),
-        verticalArrangement = Arrangement.spacedBy(if (columns >= 3) 14.dp else 18.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        verticalArrangement = Arrangement.spacedBy(18.dp),
         modifier = Modifier.fillMaxSize(),
     ) {
         items(count = items.itemCount, key = items.itemKey { it.id }) { index ->
@@ -538,7 +539,7 @@ fun WallTab() {
                 }
             },
         ) {
-            WallGrid(wallItems, columns = wallColumns) { detailFor = it }
+            WallGrid(wallItems, onInfo = { detailFor = it }, columns = wallColumns)
         }
     }
 
