@@ -144,6 +144,14 @@ fun GalleryViewer(
         }
     }
 
+    /** 看图页诊断：只记 id/序号，不记文件名与画面。用于定位「点开 A 显示 B」。 */
+    fun diag(line: String) {
+        runCatching {
+            java.io.File(context.filesDir, "viewer-diag.txt")
+                .appendText("${System.currentTimeMillis()} $line\n")
+        }
+    }
+
     // 载入相册内容（图片序列 + 视频列表）
     LaunchedEffect(initial.id) {
         val album = initial.mediaAlbumId ?: 0L
@@ -155,15 +163,37 @@ fun GalleryViewer(
                 ServiceLocator.mediaRepository.videosInAlbum(album)
             }.getOrDefault(emptyList())
             if (imgs.isNotEmpty()) {
-                images = imgs
-                startIndex = imgs.indexOfFirst { it.id == initial.id }.coerceAtLeast(0)
+                val hit = imgs.indexOfFirst { it.id == initial.id }
+                // ★ 命不中时绝不能回落第 0 张 —— 那正是「点开 A 显示 B」的稳定复现：
+                // 相册查询与列表不同源（跨页、刚入库、分组 id 变过）就会 index=-1，
+                // 旧写的 coerceAtLeast(0) 于是永远打开相册第一张。
+                // 命不中时把被点的那张顶到首位，保证点谁看谁。
+                images = if (hit >= 0) imgs else listOf(initial) + imgs.filter { it.id != initial.id }
+                startIndex = if (hit >= 0) hit else 0
+                diag("album=$album imgs=${imgs.size} hit=$hit start=$startIndex want=${initial.id} first=${images.first().id}")
+            } else {
+                diag("album=$album imgs=0 fallback-single want=${initial.id}")
             }
             videos = vids
+        } else {
+            diag("album=null single want=${initial.id}")
         }
         loaded = true
     }
-    LaunchedEffect(loaded, startIndex) {
-        if (loaded) runCatching { pagerState.scrollToPage(startIndex) }
+    // 初始页：pageCount 由 images.size 决定。images 落位前 pager 只有 1 页，
+    // 这时的 scrollToPage(startIndex) 会被丢掉，界面停在相册第一张 ——
+    // 必须等 pageCount 真的容纳 startIndex 再滚，而不是发一次就不管。
+    LaunchedEffect(images, startIndex) {
+        if (!loaded || startIndex <= 0) return@LaunchedEffect
+        repeat(10) {
+            if (pagerState.pageCount > startIndex) {
+                runCatching { pagerState.scrollToPage(startIndex) }
+                diag("scrolled to $startIndex (pageCount=${pagerState.pageCount})")
+                return@LaunchedEffect
+            }
+            delay(50)
+        }
+        diag("scroll FAILED start=$startIndex pageCount=${pagerState.pageCount}")
     }
 
     BackHandler { onDismiss() }
