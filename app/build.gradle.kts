@@ -154,4 +154,5 @@ dependencies {
 
     // JNA for libtdjson (td_json_client C interface)
     implementation("net.java.dev.jna:jna:5.15.0@aar")
+    testImplementation(kotlin("test"))
 }
