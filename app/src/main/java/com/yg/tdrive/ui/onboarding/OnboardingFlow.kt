@@ -117,7 +117,7 @@ private fun WelcomeStep(onNext: () -> Unit) {
         )
         Spacer(Modifier.height(16.dp))
         Text(
-            if (BuildConfig.DEBUG) {
+            if (BuildConfig.ALLOW_BUILT_IN_CREDS) {
                 "API 凭据已内置（开发构建），可直接登录。"
             } else {
                 "首次登录需填写你自己申请的 api_id / api_hash。"

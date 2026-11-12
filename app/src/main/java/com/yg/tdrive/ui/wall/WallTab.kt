@@ -720,22 +720,23 @@ internal fun PosterCell(
     onPlay: (MediaEntity) -> Unit,
     onInfo: (MediaEntity) -> Unit,
 ) {
+    // 手势只挂在图片区（Box）上，不包整个 Column：
+    // 整卡手势会让标题文字区也参与命中测试，滚动时每帧多一次布局遍历。
     Column(
-        modifier = Modifier
-            .clip(RoundedCornerShape(11.dp))
-            .pointerInput(m.id) {
-                detectTapGestures(
-                    onTap = { onPlay(m) },
-                    onLongPress = { onInfo(m) },
-                )
-            },
+        modifier = Modifier.clip(RoundedCornerShape(11.dp)),
     ) {
         Box(
             Modifier
                 .fillMaxWidth()
                 .aspectRatio(2f / 3f)
                 .clip(RoundedCornerShape(11.dp))
-                .background(MaterialTheme.colorScheme.surfaceContainer),
+                .background(MaterialTheme.colorScheme.surfaceContainer)
+                .pointerInput(m.id) {
+                    detectTapGestures(
+                        onTap = { onPlay(m) },
+                        onLongPress = { onInfo(m) },
+                    )
+                },
         ) {
             // 必须指定解码尺寸：三列海报每格约 120dp，不指定时 Coil 按原图分辨率
             // 解码（缩略图常 1000px+），滚动时大量 Bitmap 分配 + GC 抖动 → 掉帧。

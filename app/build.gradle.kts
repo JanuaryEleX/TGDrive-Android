@@ -63,8 +63,48 @@ android {
             if (hasKeystore) {
                 signingConfig = signingConfigs.getByName("release")
             }
+            // release 绝不内置凭据：false 让 R8 把凭据分支折叠成 null
+            buildConfigField("boolean", "ALLOW_BUILT_IN_CREDS", "false")
         }
-        debug { applicationIdSuffix = ".debug" }
+        debug {
+            applicationIdSuffix = ".debug"
+            buildConfigField("boolean", "ALLOW_BUILT_IN_CREDS", "true")
+        }
+
+        /**
+         * perf：性能测试专用。
+         *
+         * debug 构建下 Compose 的滚动性能通常只有 release 的 1/3 —— R8 未开、
+         * 方法未内联、强跳过（strongSkipping）关闭。海报墙实测 84% 掉帧、
+         * UI 线程中位 53ms，与「debug 构建的 Compose 网格」特征吻合。
+         *
+         * 本构建类型：
+         * - 开启 R8（minify + shrinkResources），拿到接近 release 的代码质量
+         * - 保留 .debug 后缀 → 与已装的 debug 包签名/包名一致，可直接覆盖安装，
+         *   登录态与本地数据全部保留
+         * - 保留 BuildConfig.DEBUG = false（R8 会折叠内置凭据分支）
+         *   → 因此显式注入内置凭据，避免每次都要手填 api_id
+         */
+        create("perf") {
+            initWith(getByName("release"))
+            applicationIdSuffix = ".debug"
+            signingConfig = signingConfigs.getByName("debug")
+            matchingFallbacks += listOf("release", "debug")
+            // 与 release 一样开 R8；保留映射文件便于看崩溃栈
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+                "proguard-perf.pro",
+            )
+            isDebuggable = true
+            // 覆盖 release 的版本后缀，避免与 release 包冲突
+            versionNameSuffix = "-perf"
+            // perf 构建 BuildConfig.DEBUG=false，内置凭据分支会被 R8 折叠。
+            // 这里单独注入开关，让 perf 包仍能零配置登录（仅本机调试用）。
+            buildConfigField("boolean", "ALLOW_BUILT_IN_CREDS", "true")
+        }
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17

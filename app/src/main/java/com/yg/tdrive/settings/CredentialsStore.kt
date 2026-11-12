@@ -30,12 +30,15 @@ class CredentialsStore(context: Context) {
     }
 
     /**
-     * 内置凭据只对 debug 生效。`BuildConfig.DEBUG` 是**编译期常量**：
-     * release 下该分支折叠为 null，两个字面量失去引用，被 R8 一并删除、不进 dex。
-     * （不要改成运行时判断如 FLAG_DEBUGGABLE——那样常量有运行时引用，字面量会留在包里。）
+     * 内置凭据只在 [BuildConfig.ALLOW_BUILT_IN_CREDS] 为 true 的构建里生效
+     * （debug / perf）。该字段是**编译期常量**，release 下为 false，
+     * 分支被 R8 折叠为 null，两个字面量失去引用、一并从 dex 删除。
+     *
+     * 不要改成运行时判断（如 FLAG_DEBUGGABLE）：那样常量存在运行时引用，
+     * 字面量会留在包里，release 就又能被提取出 api_hash 了。
      */
     private val builtIn: Pair<Int, String>? =
-        if (BuildConfig.DEBUG) (BUILT_IN_API_ID to BUILT_IN_API_HASH) else null
+        if (BuildConfig.ALLOW_BUILT_IN_CREDS) (BUILT_IN_API_ID to BUILT_IN_API_HASH) else null
 
     private val prefs: SharedPreferences by lazy {
         val masterKey = MasterKey.Builder(context)
