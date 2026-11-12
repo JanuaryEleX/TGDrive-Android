@@ -893,7 +893,7 @@ internal fun PosterCell(
  * 按「屏幕宽 - 左右 padding - 格间距」算出真实渲染像素再交给 Coil。
  * 纯函数，便于单测覆盖列数与密度变化。
  */
-internal object PosterSizing {
+object PosterSizing {
 
     /** 网格左右 contentPadding 之和（本文件 16.dp × 2）。 */
     private const val H_PADDING_DP = 32
