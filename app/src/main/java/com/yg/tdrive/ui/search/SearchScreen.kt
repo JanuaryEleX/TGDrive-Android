@@ -2,9 +2,6 @@ package com.yg.tgdrive.ui.search
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.FlowRow
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.unit.sp
@@ -376,31 +373,27 @@ fun SearchScreen(onBack: () -> Unit) {
     }
 }
 
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun KeywordCloudPanel(words: List<KeywordCloud.Word>, onSelect: (String) -> Unit) {
-    Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 22.dp)) {
+    Column(Modifier.fillMaxSize().padding(horizontal = 16.dp, vertical = 10.dp)) {
         Text("从文件名发现", style = MaterialTheme.typography.titleMedium)
-        Spacer(Modifier.height(6.dp))
-        Text("点击关键词筛选本地视频与图片", style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Spacer(Modifier.height(20.dp))
-        val maxCount = words.maxOfOrNull { it.count }?.coerceAtLeast(1) ?: 1
-        FlowRow(horizontalArrangement = Arrangement.spacedBy(9.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            words.forEach { word ->
-                val prominence = word.count.toFloat() / maxCount
-                Text(
-                    word.text,
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(18.dp))
-                        .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.07f + prominence * 0.12f))
-                        .clickable { onSelect(word.text) }
-                        .padding(horizontal = 13.dp, vertical = 9.dp),
-                    fontSize = (13f + 6f * prominence).sp,
-                    color = MaterialTheme.colorScheme.primary,
-                )
-            }
-        }
+        Spacer(Modifier.height(4.dp))
+        Text(
+            "字号越大，出现得越多；点一下直接筛选",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(12.dp))
+        KeywordCloudView(
+            words = words,
+            onSelect = onSelect,
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f)
+                .clip(RoundedCornerShape(22.dp))
+                .background(MaterialTheme.colorScheme.surfaceContainerLowest)
+                .padding(12.dp),
+        )
     }
 }
 

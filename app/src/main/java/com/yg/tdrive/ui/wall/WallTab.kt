@@ -3,13 +3,12 @@ package com.yg.tgdrive.ui.wall
 import androidx.compose.foundation.background
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.combinedClickable
-import androidx.compose.animation.AnimatedContent
-import androidx.compose.animation.togetherWith
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.slideInHorizontally
-import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.zIndex
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
@@ -49,6 +48,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -78,6 +78,7 @@ import coil.request.ImageRequest
 import com.yg.tgdrive.ServiceLocator
 import com.yg.tgdrive.data.BottomBarPolicy
 import com.yg.tgdrive.data.FavoritesPolicy
+import com.yg.tgdrive.data.TabLayerPolicy
 import com.yg.tgdrive.data.MediaKind
 import com.yg.tgdrive.td.AuthState
 import com.yg.tgdrive.ui.common.AppIcons
@@ -114,6 +115,8 @@ fun MainScreen(
     /** 长按底栏后打开该栏筛选；无筛选的最近/收藏保持普通切换。 */
     var filterRequest by remember { mutableStateOf<Int?>(null) }
     var tab by remember { mutableStateOf(2) }
+    // 已进入过的页面：保持存活，切回来不再重建与重新查库
+    val visitedTabs = remember { mutableStateListOf(2) }
 
     Column(
         modifier = Modifier
@@ -241,26 +244,34 @@ fun MainScreen(
         }
 
         Box(Modifier.weight(1f)) {
-            AnimatedContent(
-                targetState = tab,
-                transitionSpec = {
-                    val direction = if (targetState > initialState) 1 else -1
-                    (fadeIn(tween(220)) + slideInHorizontally(tween(220)) { it * direction / 7 }) togetherWith
-                        (fadeOut(tween(180)) + slideOutHorizontally(tween(180)) { -it * direction / 7 })
-                },
-                label = "底栏页面切换",
-            ) { selectedTab ->
-                when (selectedTab) {
-                    BottomBarPolicy.RECENT -> RecentTab()
-                    BottomBarPolicy.FAVORITES -> FavoritesTab()
-                    BottomBarPolicy.VIDEOS -> WallTab(
-                        openFilterRequest = filterRequest == BottomBarPolicy.VIDEOS,
-                        onFilterOpened = { filterRequest = null },
-                    )
-                    else -> GalleryTab(
-                        openFilterRequest = filterRequest == BottomBarPolicy.IMAGES,
-                        onFilterOpened = { filterRequest = null },
-                    )
+            // 页面保活：首次进入后不再销毁重建（不重新查库、不丢滚动位置）。
+            // 组合顺序固定，只用 zIndex 决定层级；非活动页拦截触摸。
+            visitedTabs.toList().forEach { index ->
+                val interactive = TabLayerPolicy.isInteractive(index, tab)
+                val layerAlpha by animateFloatAsState(
+                    targetValue = if (interactive) 1f else 0f,
+                    animationSpec = tween(durationMillis = if (interactive) 170 else 110),
+                    label = "tabAlpha$index",
+                )
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .zIndex(TabLayerPolicy.zIndex(index, tab))
+                        .graphicsLayer { alpha = layerAlpha }
+                        .then(if (interactive) Modifier else Modifier.blockTouches()),
+                ) {
+                    when (index) {
+                        BottomBarPolicy.RECENT -> RecentTab()
+                        BottomBarPolicy.FAVORITES -> FavoritesTab()
+                        BottomBarPolicy.VIDEOS -> WallTab(
+                            openFilterRequest = filterRequest == BottomBarPolicy.VIDEOS,
+                            onFilterOpened = { filterRequest = null },
+                        )
+                        else -> GalleryTab(
+                            openFilterRequest = filterRequest == BottomBarPolicy.IMAGES,
+                            onFilterOpened = { filterRequest = null },
+                        )
+                    }
                 }
             }
         }
@@ -286,8 +297,12 @@ fun MainScreen(
                         .weight(1f)
                         .fillMaxHeight()
                         .combinedClickable(
-                            onClick = { tab = index },
+                            onClick = {
+                                if (index !in visitedTabs) visitedTabs.add(index)
+                                tab = index
+                            },
                             onLongClick = {
+                                if (index !in visitedTabs) visitedTabs.add(index)
                                 tab = index
                                 if (BottomBarPolicy.supportsFilter(index)) filterRequest = index
                             },
@@ -999,5 +1014,14 @@ internal fun PosterCell(
             lineHeight = 16.sp,
             modifier = Modifier.padding(horizontal = 1.dp),
         )
+    }
+}
+
+/** 下层（非活动）页面：在 Initial 阶段吃掉所有触摸，避免隐藏页被滑动/点击。 */
+private fun Modifier.blockTouches(): Modifier = pointerInput(Unit) {
+    awaitPointerEventScope {
+        while (true) {
+            awaitPointerEvent(PointerEventPass.Initial).changes.forEach { it.consume() }
+        }
     }
 }

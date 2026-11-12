@@ -43,10 +43,9 @@ fun AppRoot() {
     AnimatedContent(
         targetState = route,
         transitionSpec = {
-            val forward = (targetState == Routes.HOME) || (initialState == Routes.ONBOARDING)
-            val dir = if (forward) 1 else -1
-            (fadeIn(tween(200)) + slideInHorizontally(tween(220)) { if (dir > 0) it / 8 else -it / 8 }) togetherWith
-                fadeOut(tween(160))
+            // 轻量过渡：位移只有 1/16，主要靠淡入，避免整页滚动列表参与大幅位移
+            (fadeIn(tween(150)) + slideInHorizontally(tween(170)) { it / 16 }) togetherWith
+                fadeOut(tween(120))
         },
         label = "页面切换",
     ) { r ->
