@@ -91,8 +91,9 @@ fun DrivePickerStep(onFinished: () -> Unit) {
                     isSavedMessages = isSaved,
                 )
             }
-            // 「我的收藏」恒定置顶；getChats 没返回时也补一条，保证用户总能选到
-            options = SavedMessagesPolicy.pinFirst(list, myId).map {
+            // 不自动注入「我的收藏」：只列出 getChats 真实返回的条目。
+            // 收藏是否启用由设置页开关决定（默认不启用）。
+            options = list.map {
                 ChatOption(it.chatId, it.title, SavedMessagesPolicy.subtitle(it))
             }
             loading = false

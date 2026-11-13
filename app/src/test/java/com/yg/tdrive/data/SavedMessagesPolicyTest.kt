@@ -5,8 +5,10 @@ import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
 /**
- * 「我的收藏」置顶规则回归：确保 Saved Messages 恒在勾选列表首位、
- * 标题统一为「我的收藏」、入库 order_idx 恒为 -1（驱动器列表/海报墙默认选中）。
+ * 「我的收藏」开关规则回归。
+ *
+ * 关键约束（用户明确要求）：这一项必须在**设置页驱动扫描处由用户勾选**才启用，
+ * **默认不启用** —— 不预置驱动器、不自动挂载、不触发首扫。
  */
 class SavedMessagesPolicyTest {
 
@@ -14,6 +16,28 @@ class SavedMessagesPolicyTest {
 
     private fun chat(id: Long, title: String, type: String = "chatTypeSupergroup") =
         SelectableChat(chatId = id, title = title, type = type)
+
+    // ---- 默认值 ----
+
+    @Test
+    fun `默认不启用`() {
+        assertTrue(!SavedMessagesPolicy.DEFAULT_ENABLED)
+    }
+
+    @Test
+    fun `默认状态下 planToggle 未调用即无动作`() {
+        // 未登录（myUserId=0）时任何操作都不得落库
+        assertEquals(
+            SavedMessagesPolicy.TogglePlan.Unavailable,
+            SavedMessagesPolicy.planToggle(wantEnabled = true, myUserId = 0L),
+        )
+        assertEquals(
+            SavedMessagesPolicy.TogglePlan.Unavailable,
+            SavedMessagesPolicy.planToggle(wantEnabled = false, myUserId = 0L),
+        )
+    }
+
+    // ---- 识别与命名 ----
 
     @Test
     fun `isSavedMessages 只在 myUserId 已知且相等时成立`() {
@@ -36,49 +60,47 @@ class SavedMessagesPolicyTest {
     fun `resolveOrderIdx 收藏恒为 -1 排在所有普通驱动器之前`() {
         assertEquals(-1, SavedMessagesPolicy.resolveOrderIdx(me, me, fallback = 3))
         assertEquals(3, SavedMessagesPolicy.resolveOrderIdx(5L, me, fallback = 3))
-        // 置顶语义：-1 小于任何普通驱动器序号
         assertTrue(SavedMessagesPolicy.ORDER_IDX < 0)
     }
 
+    // ---- 开关决策 ----
+
     @Test
-    fun `pinFirst 把已存在的收藏抽出来置顶并统一标题`() {
-        val list = listOf(chat(11L, "频道A"), chat(me, "张三"), chat(12L, "群B"))
-        val out = SavedMessagesPolicy.pinFirst(list, me)
-        assertEquals(listOf(me, 11L, 12L), out.map { it.chatId })
-        assertEquals("我的收藏", out.first().title)
-        // 不产生重复行
-        assertEquals(3, out.size)
-        assertEquals(1, out.count { it.chatId == me })
+    fun `勾选后返回 Enable 且固定标题与置顶序号`() {
+        val plan = SavedMessagesPolicy.planToggle(wantEnabled = true, myUserId = me)
+        assertTrue(plan is SavedMessagesPolicy.TogglePlan.Enable)
+        plan as SavedMessagesPolicy.TogglePlan.Enable
+        assertEquals(me, plan.chatId)
+        assertEquals("我的收藏", plan.title)
+        assertEquals(-1, plan.orderIdx)
+        // 置顶语义：序号小于任何普通驱动器
+        assertTrue(plan.orderIdx < 0)
     }
 
     @Test
-    fun `pinFirst 在收藏缺失时补一条置顶`() {
-        val list = listOf(chat(11L, "频道A"), chat(12L, "群B"))
-        val out = SavedMessagesPolicy.pinFirst(list, me)
-        assertEquals(3, out.size)
-        assertEquals(me, out.first().chatId)
-        assertEquals("我的收藏", out.first().title)
-        assertEquals(SavedMessagesPolicy.CHAT_TYPE, out.first().type)
-        assertEquals(listOf(11L, 12L), out.drop(1).map { it.chatId })
+    fun `取消勾选返回 Disable 且指向同一个 chatId`() {
+        val plan = SavedMessagesPolicy.planToggle(wantEnabled = false, myUserId = me)
+        assertTrue(plan is SavedMessagesPolicy.TogglePlan.Disable)
+        assertEquals(me, (plan as SavedMessagesPolicy.TogglePlan.Disable).chatId)
     }
 
     @Test
-    fun `pinFirst 在 myUserId 未知时原样返回`() {
-        val list = listOf(chat(11L, "频道A"))
-        assertEquals(list, SavedMessagesPolicy.pinFirst(list, 0L))
+    fun `重复勾选决策幂等 每次都是同一个 Enable`() {
+        val a = SavedMessagesPolicy.planToggle(true, me)
+        val b = SavedMessagesPolicy.planToggle(true, me)
+        assertEquals(a, b)
     }
 
-    @Test
-    fun `pinFirst 对空列表也能补出收藏`() {
-        val out = SavedMessagesPolicy.pinFirst(emptyList(), me)
-        assertEquals(1, out.size)
-        assertEquals("我的收藏", out.single().title)
-        assertTrue(out.single().isSavedMessages)
-    }
+    // ---- 副标题 ----
 
     @Test
     fun `subtitle 收藏用专属文案其余按类型翻译`() {
-        val saved = SavedMessagesPolicy.pinFirst(emptyList(), me).single()
+        val saved = SelectableChat(
+            chatId = me,
+            title = SavedMessagesPolicy.TITLE,
+            type = SavedMessagesPolicy.CHAT_TYPE,
+            isSavedMessages = true,
+        )
         assertEquals(SavedMessagesPolicy.SUBTITLE, SavedMessagesPolicy.subtitle(saved))
         assertEquals(
             "私有频道",
@@ -89,12 +111,5 @@ class SavedMessagesPolicyTest {
         // 未知类型原样透出，空类型不显示空白
         assertEquals("chatTypeSecret", SavedMessagesPolicy.subtitle(chat(8L, "x", "chatTypeSecret")))
         assertEquals("聊天", SavedMessagesPolicy.subtitle(chat(9L, "x", "")))
-    }
-
-    @Test
-    fun `pinFirst 置顶的收藏带 isSavedMessages 标记`() {
-        val out = SavedMessagesPolicy.pinFirst(listOf(chat(11L, "频道A")), me)
-        assertTrue(out.first().isSavedMessages)
-        assertTrue(!out[1].isSavedMessages)
     }
 }

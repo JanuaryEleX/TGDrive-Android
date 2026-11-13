@@ -5,13 +5,14 @@ package com.yg.tgdrive.data
  *
  * TDLib 里 Saved Messages 就是「和自己对话」的那条 chat，chat_id 等于当前登录用户
  * 自身 user id（getMe 取），所以它天然会混在一堆聊天里、标题是本机账号名，
- * 在勾选列表里既认不出来也不在顶部。这里把三条规则收口成纯函数：
+ * 在勾选列表里既认不出来也不在顶部。这里把规则收口成纯函数：
  *
- * 1. [pinFirst]  —— 勾选列表恒定把「我的收藏」放第一位（不存在则补一条）
- * 2. [resolveTitle] —— 显示名统一成「我的收藏」，不显示账号名
- * 3. [resolveOrderIdx] —— 入库时 order_idx 恒为 -1，驱动器列表/海报墙默认选中它
+ * 1. [isSavedMessages] —— 识别（chatId == 自己 user id）
+ * 2. [resolveTitle]    —— 显示名统一成「我的收藏」，不显示账号名
+ * 3. [resolveOrderIdx] —— 启用后 order_idx 恒为 -1，驱动器列表里置顶
+ * 4. [planToggle]      —— 设置页开关的决策：默认**不启用**，勾选才建驱动器
  *
- * 全是无副作用的纯函数，便于单测覆盖；调用方（DriveManager / 引导页）只负责取
+ * 全是无副作用的纯函数，便于单测覆盖；调用方（DriveManager / 设置页）只负责取
  * myUserId 并落库。
  */
 object SavedMessagesPolicy {
@@ -27,6 +28,14 @@ object SavedMessagesPolicy {
 
     /** Saved Messages 的 TDLib chat type（和自己对话 = 普通私聊）。 */
     const val CHAT_TYPE = "chatTypePrivate"
+
+    /**
+     * 默认是否启用。
+     *
+     * 用户要求：这一项必须由用户在**设置页驱动扫描处主动勾选**才生效，
+     * 不能默认出现在任何人的驱动器列表里（不预置、不自动挂载、不首扫）。
+     */
+    const val DEFAULT_ENABLED = false
 
     /** myUserId 未知（0）时不判定，避免把所有 chatId=0 误认成收藏。 */
     fun isSavedMessages(chatId: Long, myUserId: Long): Boolean =
@@ -58,22 +67,35 @@ object SavedMessagesPolicy {
         if (isSavedMessages(chatId, myUserId)) ORDER_IDX else fallback
 
     /**
-     * 把收藏插到列表首位。
+     * 设置页开关的落库决策（纯函数，无副作用）。
      *
-     * - 已在列表里：抽出来换成统一标题后置顶，不产生重复行
-     * - 不在列表里（getChats 没返回 / 被 limit 截断）：补一条
-     * - myUserId 未知：原样返回，不做猜测
+     * @param wantEnabled 用户点击后的目标状态（勾选=true / 取消=false）
+     * @param myUserId    getMe 拿到的自身 id；0 表示还没登录好
      */
-    fun pinFirst(items: List<SelectableChat>, myUserId: Long): List<SelectableChat> {
-        if (myUserId == 0L) return items
-        val existing = items.firstOrNull { it.chatId == myUserId }
-        val rest = items.filter { it.chatId != myUserId }
-        val saved = SelectableChat(
+    fun planToggle(wantEnabled: Boolean, myUserId: Long): TogglePlan = when {
+        // 登录态没就绪时既不能建也不能删，UI 应禁用开关
+        myUserId == 0L -> TogglePlan.Unavailable
+        !wantEnabled -> TogglePlan.Disable(chatId = myUserId)
+        else -> TogglePlan.Enable(
             chatId = myUserId,
             title = TITLE,
-            type = existing?.type?.takeIf { it.isNotBlank() } ?: CHAT_TYPE,
-            isSavedMessages = true,
+            orderIdx = ORDER_IDX,
         )
-        return listOf(saved) + rest
+    }
+
+    /** [planToggle] 的结果。 */
+    sealed interface TogglePlan {
+        /** getMe 未就绪，本轮什么也不做。 */
+        data object Unavailable : TogglePlan
+
+        /** 取消勾选：移除该驱动器（连同本地索引），云端消息不动。 */
+        data class Disable(val chatId: Long) : TogglePlan
+
+        /** 勾选启用：新建驱动器，固定标题与置顶序号。 */
+        data class Enable(
+            val chatId: Long,
+            val title: String,
+            val orderIdx: Int,
+        ) : TogglePlan
     }
 }

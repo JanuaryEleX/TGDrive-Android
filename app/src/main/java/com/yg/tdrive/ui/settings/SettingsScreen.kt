@@ -34,6 +34,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -54,6 +55,7 @@ import androidx.compose.ui.unit.dp
 import com.yg.tgdrive.BuildConfig
 import com.yg.tgdrive.CrashLogger
 import com.yg.tgdrive.ServiceLocator
+import com.yg.tgdrive.data.DriveManager
 import com.yg.tgdrive.data.SavedMessagesPolicy
 import com.yg.tgdrive.data.ScanDiagnostics
 import com.yg.tgdrive.data.SelectableChat
@@ -465,6 +467,13 @@ private fun DriveSection() {
         }
     }
 
+    Spacer(Modifier.height(12.dp))
+
+    SavedMessagesToggleCard(
+        drives = drives,
+        onError = { error = it },
+    )
+
     if (showAdd) {
         AddDriveDialog(
             existingChatIds = drives.map { it.chatId }.toSet(),
@@ -494,6 +503,107 @@ private fun DriveSection() {
             },
             dismissButton = { TextButton(onClick = { confirmDeleteFor = null }) { Text("取消") } },
         )
+    }
+}
+
+// ---------------------------------------------------------------- 我的收藏开关
+
+/**
+ * 「我的收藏」（Telegram Saved Messages）作为驱动器的开关。
+ *
+ * 默认**关闭**：库里没有这条驱动器时开关就是关的，不预置、不自动挂载、不首扫。
+ * 用户勾选后才调用 DriveManager.setSavedMessagesEnabled(true) 建驱动器，
+ * order_idx = -1 使其在驱动器列表置顶；取消勾选则移除（云端消息不受影响）。
+ *
+ * 开关状态直接由 drives 列表推导（含 chatId == 自己 user id 的行），不另存
+ * 偏好项 —— 单一事实来源，避免「开关是开着的但驱动器已经没了」这类不一致。
+ */
+@Composable
+private fun SavedMessagesToggleCard(
+    drives: List<DriveEntity>,
+    onError: (String) -> Unit,
+) {
+    val scope = rememberCoroutineScope()
+    var myUserId by remember { mutableStateOf<Long?>(null) }
+    var saving by remember { mutableStateOf(false) }
+    var hint by remember { mutableStateOf<String?>(null) }
+
+    // 读一次 getMe 拿自身 id（= Saved Messages 的 chat_id）；未登录时为 null
+    LaunchedEffect(Unit) {
+        myUserId = runCatching {
+            ServiceLocator.driveManager.fetchMyUserId().takeIf { it != 0L }
+        }.getOrNull()
+    }
+
+    val enabled = myUserId != null && drives.any { it.chatId == myUserId }
+    val busy = myUserId == null || saving
+
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text(SavedMessagesPolicy.TITLE, style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        "把 Telegram「我的收藏」作为驱动器参与扫描，启用后固定排在第一位。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(
+                    checked = enabled,
+                    enabled = !busy,
+                    onCheckedChange = { want ->
+                        if (saving) return@Switch
+                        saving = true
+                        hint = null
+                        scope.launch {
+                            try {
+                                when (val r =
+                                    ServiceLocator.driveManager.setSavedMessagesEnabled(want)) {
+                                    is DriveManager.SavedMessagesToggle.Enabled -> {
+                                        // 首扫是分钟级任务，挂 appScope：离开设置页也不中断
+                                        ServiceLocator.appScope.launch {
+                                            runCatching {
+                                                ServiceLocator.mediaRepository.fullScan(r.drive.id)
+                                            }
+                                        }
+                                        hint = "已启用，正在建立索引…"
+                                    }
+                                    is DriveManager.SavedMessagesToggle.AlreadyEnabled ->
+                                        hint = "已启用"
+                                    DriveManager.SavedMessagesToggle.Disabled ->
+                                        hint = "已停用，本地索引已清除（云端消息未动）"
+                                    DriveManager.SavedMessagesToggle.AlreadyDisabled ->
+                                        hint = "已停用"
+                                    DriveManager.SavedMessagesToggle.Unavailable ->
+                                        onError("未登录，无法启用我的收藏")
+                                }
+                            } catch (t: Throwable) {
+                                onError("操作失败：${t.message ?: t.javaClass.simpleName}")
+                            } finally {
+                                saving = false
+                            }
+                        }
+                    },
+                )
+            }
+            if (myUserId == null) {
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    "登录完成后才能启用",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            hint?.let {
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
     }
 }
 
