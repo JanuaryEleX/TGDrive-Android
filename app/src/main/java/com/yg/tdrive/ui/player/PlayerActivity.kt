@@ -194,7 +194,9 @@ class PlayerActivity : ComponentActivity() {
                     buffering.value = false
                     prepared.value = true
                     loading.value = false
-                    hudText.value = PlaybackRetryOverlayPolicy.afterReady(hudText.value)
+                    val overlay = PlayerOverlayPolicy.onReady(PlayerOverlay(hudText.value, errorText.value))
+                    hudText.value = overlay.hud
+                    errorText.value = overlay.error
                     autoRetry = 0
                     preparing = false
                     slowPrepare.value = false
@@ -303,8 +305,9 @@ class PlayerActivity : ComponentActivity() {
         }
         title.value = entity.displayName
         metaLine.value = buildMeta(entity)
-        errorText.value = null
-        hudText.value = PlaybackRetryOverlayPolicy.afterReady(hudText.value)
+        val overlay = PlayerOverlayPolicy.onPrepareStart(PlayerOverlay(hudText.value, errorText.value))
+        hudText.value = overlay.hud
+        errorText.value = overlay.error
         prepared.value = false
         buffering.value = true
         loading.value = true
@@ -483,15 +486,18 @@ class PlayerActivity : ComponentActivity() {
             autoRetry++
             // 抓当前位置：重试必须从断点继续，不能跳回开头
             retryResumeMs = player?.currentPosition?.coerceAtLeast(0L) ?: retryResumeMs
-            hudText.value = "播放中断，正在重试 $autoRetry/$MAX_AUTO_RETRY"
+            hudText.value = PlayerOverlayPolicy.retryHud(autoRetry, MAX_AUTO_RETRY)
             lifecycleScope.launch {
                 delay(1_200L * autoRetry)
                 preparePlayer(initial = false)
             }
             return
         }
-        hudText.value = PlaybackRetryOverlayPolicy.afterTerminalError(hudText.value)
-        errorText.value = describeError(error)
+        val overlay = PlayerOverlayPolicy.onTerminalError(
+            PlayerOverlay(hudText.value, errorText.value), describeError(error)
+        )
+        hudText.value = overlay.hud
+        errorText.value = overlay.error
         loading.value = false
         pokeControls(true)
     }

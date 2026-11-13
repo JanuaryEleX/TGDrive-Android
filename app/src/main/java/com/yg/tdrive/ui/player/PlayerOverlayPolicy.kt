@@ -1,26 +1,25 @@
 package com.yg.tgdrive.ui.player
 
-/**
- * 临时现状实现仅供红灯测试：onReady 不清旧错误层 / 重试 HUD。
- * 替换为状态机后重新执行所有单测。
- */
+/** 错误层与中央 HUD 的状态转换，避免播放已恢复而旧错误仍遮住画面。 */
 internal data class PlayerOverlay(
     val hud: String? = null,
     val error: String? = null,
 )
 
 internal object PlayerOverlayPolicy {
-    internal const val RETRY_HUD_PREFIX = "播放中断，正在重试 "
-    fun retryHud(attempt: Int, max: Int): String = "$RETRY_HUD_PREFIX$attempt/$max"
-    fun onReady(current: PlayerOverlay): PlayerOverlay = current
-    fun onPrepareStart(current: PlayerOverlay): PlayerOverlay = current.copy(error = null)
-    fun onTerminalError(current: PlayerOverlay, message: String): PlayerOverlay =
-        current.copy(error = message)
-}
+    private const val RETRY_HUD_PREFIX = "播放中断，正在重试 "
 
-internal object PlaybackRetryOverlayPolicy {
-    private const val RETRY_PREFIX = "播放中断，正在重试 "
-    fun afterReady(current: String?): String? =
-        current?.takeUnless { it.startsWith(RETRY_PREFIX) }
-    fun afterTerminalError(current: String?): String? = afterReady(current)
+    fun retryHud(attempt: Int, max: Int): String = "$RETRY_HUD_PREFIX$attempt/$max"
+
+    private fun withoutRetryHud(hud: String?): String? =
+        hud?.takeUnless { it.startsWith(RETRY_HUD_PREFIX) }
+
+    /** ExoPlayer 真正恢复就绪时，不再显示先前的错误层。 */
+    fun onReady(current: PlayerOverlay): PlayerOverlay =
+        PlayerOverlay(hud = withoutRetryHud(current.hud))
+
+    fun onPrepareStart(current: PlayerOverlay): PlayerOverlay = onReady(current)
+
+    fun onTerminalError(current: PlayerOverlay, message: String): PlayerOverlay =
+        PlayerOverlay(hud = withoutRetryHud(current.hud), error = message)
 }
