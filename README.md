@@ -38,6 +38,14 @@
 
 3. **申请 API 凭据**：到 [my.telegram.org](https://my.telegram.org) → API development tools，用小号注册一个应用，拿到 `api_id` / `api_hash`（App 首次启动的 Onboarding 会引导填入，加密存储在本地）。
 
+   想在 **debug 包**里免手填（仅本机调试便利），把凭据写进仓库外的 `local.properties`：
+   ```properties
+   tg.apiId=1234567
+   tg.apiHash=0123456789abcdef0123456789abcdef
+   ```
+   构建脚本会把它注入 `BuildConfig.BUILT_IN_API_ID/HASH`；文件缺失时 debug 包不内置任何凭据，
+   Onboarding 要求手填。**release 包永远不内置凭据**（`ALLOW_BUILT_IN_CREDS=false`，R8 折叠）。
+
 4. **真机安装登录**：连接 arm64 真机 Run 安装；用**专用小号**登录（主号零接触，见 SPEC §7 小号原则）。建议先在 Onboarding 配好 MTProto/SOCKS5 代理（可跳过直连）。
 
 ## 目录结构
