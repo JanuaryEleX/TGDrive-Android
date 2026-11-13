@@ -18,13 +18,13 @@ android {
     // 无法升级覆盖，且崩溃日志里的版本号无法区分。versionName 同步递增：
     // 新功能/行为变化 +0.1.0；仅修 bug +0.0.1。两者都在本文件硬编码（随 git 可追溯），
     // 不放进仓库外的 properties——版本号必须和源码一起被 review。
-    // 当前：0.3.0 / 3（Track B：release 签名 + 本地崩溃日志 + 版本纪律）
+    // 当前：0.4.0 / 4（设置页「已缓存」占用；播放恢复清残留提示）
     defaultConfig {
         applicationId = "com.yg.tgdrive"
         minSdk = 24
         targetSdk = 35
-        versionCode = 3
-        versionName = "0.3.0"
+        versionCode = 4
+        versionName = "0.4.0"
         ndk { abiFilters += listOf("arm64-v8a") }
     }
 
