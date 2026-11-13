@@ -2,12 +2,16 @@
 
 > 无服务端 Telegram 网盘安卓 App —— 用 TG 专用小号的私有频道当无限容量网盘，通过 TDLib 直连 MTProto 流式观看视频 / 浏览图片，**全程无自建服务端**：无后端、无 VPS、无域名，APK 自装自用。
 
+当前版本 **0.4.2**（versionCode 6）。
+
 - 4GB 1080p 视频 2 秒起播，随机拖动 1.5 秒内定位（并发分片下载 + LRU 缓存）
 - 海报墙网盘体验：缩略图墙 + 驱动器分区 + 全局搜索 + 继续观看
-- 并发下载 1~8 路可调（默认 4），非 Premium 聚合 5~8 MB/s
+- 并发下载 1~16 路可调（默认 4），非 Premium 聚合 5~8 MB/s
+- 缓存上限 1~64 GB 可调，设置页显示「已缓存 X / 上限 Y（N%）」
+- **我的收藏**（Telegram Saved Messages）作为驱动器来源，在设置页「驱动器管理」卡片内勾选启用，**默认关闭**；启用后置顶为第一个驱动器
 - 仅供个人自用（TG 云端无 SLA，重要内容请保留独立备份）
 
-完整设计规格见 **[docs/SPEC.md](docs/SPEC.md)**（唯一实现依据，含全部 29 项设计决策）。
+完整设计规格见 **[docs/SPEC.md](docs/SPEC.md)**（唯一实现依据，含全部 29 项设计决策）。设计取舍见 [docs/DESIGN.md](docs/DESIGN.md)，界面改版记录见 [docs/UI-REDESIGN.md](docs/UI-REDESIGN.md)。
 
 ## 前置条件
 
@@ -18,7 +22,8 @@
 | Android SDK | 35 (Android 15) | compileSdk / targetSdk = 35 |
 | NDK | **不需要** | TDLib 用预编译 so，纯 JNA 直调，无本地代码要编 |
 
-设备要求：**arm64-v8a 真机**（Android 7.0 / API 24+）。模拟器不可用（只打包 arm64-v8a 单 ABI）。
+设备要求：**arm64-v8a 真机**（Android 7.0 / API 24+）为正式目标。APK 只打包 arm64-v8a 单 ABI；
+x86_64 模拟器需依赖 houdini 指令翻译才能装上（如 MuMu 实测可运行，但 TDLib 与视频解码稳定性不作保证）。
 
 ## 快速开始
 
@@ -56,7 +61,9 @@ tgdrive/
 │   ├── fetch-tdlib.ps1        # 拉取 libtdjson.so（Windows 主脚本）
 │   └── fetch-tdlib.sh         # 同功能的 bash 版（macOS/Linux/WSL）
 ├── docs/
-│   └── SPEC.md                # ★ 完整规格说明书（架构/模块/Schema/里程碑）
+│   ├── SPEC.md                # ★ 完整规格说明书（架构/模块/Schema/里程碑）
+│   ├── DESIGN.md              # 设计取舍与备选方案排除记录
+│   └── UI-REDESIGN.md         # 界面改版记录（视觉/布局演进）
 ├── app/
 │   └── src/main/
 │       ├── java/com/yg/tdrive/
