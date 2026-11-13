@@ -29,6 +29,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.yg.tgdrive.ServiceLocator
+import com.yg.tgdrive.data.SavedMessagesPolicy
+import com.yg.tgdrive.data.SelectableChat
 import com.yg.tgdrive.td.tdObj
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -65,34 +67,34 @@ fun DrivePickerStep(onFinished: () -> Unit) {
             val meResp = td.call(tdObj("@type" to "getMe"))
             val myId = meResp["id"]?.jsonPrimitive?.longOrNull() ?: 0L
 
-            val list = mutableListOf<ChatOption>()
+            val list = mutableListOf<SelectableChat>()
             for (id in chatIds) {
                 // 每个请求间隔防风控
                 delay(50)
                 val chat = td.call(tdObj("@type" to "getChat", "chat_id" to id))
                 val type = chat["type"] as? JsonObject ?: continue
                 val t = type["@type"]?.jsonPrimitive?.content ?: continue
-                val isSavedMessages = id == myId
-                val selectable = isSavedMessages ||
+                val isSaved = SavedMessagesPolicy.isSavedMessages(id, myId)
+                val selectable = isSaved ||
                     t == "chatTypePrivateChannel" ||
                     t == "chatTypeSupergroup" ||
                     t == "chatTypeBasicGroup"
                 if (!selectable) continue
-                val title = if (isSavedMessages) {
-                    "收藏（Saved Messages）"
-                } else {
+                val rawTitle = if (isSaved) null else {
                     chat["title"]?.jsonPrimitive?.content
-                        ?: chat["first_name"]?.jsonPrimitive?.content ?: "未知聊天"
+                        ?: chat["first_name"]?.jsonPrimitive?.content
                 }
-                val subtitle = when {
-                    isSavedMessages -> "与本机账号的私人存储对话"
-                    t == "chatTypePrivateChannel" -> "私有频道"
-                    t == "chatTypeSupergroup" -> "超级群组"
-                    else -> "普通群组"
-                }
-                list += ChatOption(id, title, subtitle)
+                list += SelectableChat(
+                    chatId = id,
+                    title = SavedMessagesPolicy.resolveTitle(id, myId, rawTitle),
+                    type = t,
+                    isSavedMessages = isSaved,
+                )
             }
-            options = list
+            // 「我的收藏」恒定置顶；getChats 没返回时也补一条，保证用户总能选到
+            options = SavedMessagesPolicy.pinFirst(list, myId).map {
+                ChatOption(it.chatId, it.title, SavedMessagesPolicy.subtitle(it))
+            }
             loading = false
         } catch (t: Throwable) {
             loadError = "拉取聊天列表失败：${t.message ?: t::class.java.simpleName}"

@@ -13,13 +13,16 @@ import com.yg.tgdrive.download.OfflineDownloadManager
 import com.yg.tgdrive.download.StreamingDownloadManager
 import com.yg.tgdrive.settings.CredentialsStore
 import com.yg.tgdrive.settings.SettingsStore
+import com.yg.tgdrive.td.AuthState
 import com.yg.tgdrive.td.TdClient
 import com.yg.tgdrive.td.TdProxyManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * 手写 DI 接线中心（SPEC §3：不上 Hilt）。
@@ -177,6 +180,40 @@ object ServiceLocator {
             offlineDownloads.reload()
 
             initialized = true
+        }
+    }
+
+    /**
+     * 登录就绪后把「我的收藏」挂成驱动器并置顶（幂等）。
+     *
+     * 用户需求：驱动器扫描里必须有 tg 的「我的收藏」，且固定排第一位。
+     * 老版本用户库里根本没有这条记录，只靠设置页手动勾选发现不了，所以这里在
+     * authState Ready 后自动补一次；新建时顺带触发首次全量扫描，已有则只纠序号/标题。
+     */
+    fun scheduleSavedMessagesPin() {
+        appScope.launch {
+            // 等真正登录完成（首装引导里登录可能晚于进程启动几十秒），最多等 10 分钟；
+            // 超时说明本轮没登录，不写库，下次启动再看。
+            val ready = withTimeoutOrNull(10 * 60_000L) {
+                tdClient.authState.first { it is AuthState.Ready }
+            } ?: run {
+                Log.w("ServiceLocator", "我的收藏挂载跳过：本轮未登录完成")
+                return@launch
+            }
+            val result = runCatching { driveManager.ensureSavedMessagesDrive() }
+                .onFailure { Log.w("ServiceLocator", "我的收藏挂载失败（下次启动重试）", it) }
+                .getOrNull() ?: return@launch
+            when (result) {
+                is DriveManager.SavedMessagesResult.Unavailable ->
+                    Log.w("ServiceLocator", "我的收藏挂载跳过：getMe 未就绪")
+                is DriveManager.SavedMessagesResult.AlreadyPinned ->
+                    Log.i("ServiceLocator", "我的收藏已置顶: ${result.drive.id}")
+                is DriveManager.SavedMessagesResult.Created -> {
+                    Log.i("ServiceLocator", "我的收藏已新建: ${result.drive.id}，开始首次扫描")
+                    // 复用设置页「重扫」的桥（内部走 fullScan），保持单一扫描入口
+                    driveManager.rescan(result.drive.id)
+                }
+            }
         }
     }
 

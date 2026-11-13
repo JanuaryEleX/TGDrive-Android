@@ -54,6 +54,7 @@ import androidx.compose.ui.unit.dp
 import com.yg.tgdrive.BuildConfig
 import com.yg.tgdrive.CrashLogger
 import com.yg.tgdrive.ServiceLocator
+import com.yg.tgdrive.data.SavedMessagesPolicy
 import com.yg.tgdrive.data.ScanDiagnostics
 import com.yg.tgdrive.data.SelectableChat
 import com.yg.tgdrive.download.CacheUsage
@@ -617,7 +618,7 @@ private fun AddDriveDialog(
                                             },
                                         )
                                         Text(
-                                            if (already) "已添加" else chat.type,
+                                            if (already) "已添加" else SavedMessagesPolicy.subtitle(chat),
                                             style = MaterialTheme.typography.bodySmall,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                                         )

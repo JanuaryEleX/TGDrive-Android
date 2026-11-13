@@ -99,6 +99,12 @@ class TgDriveApp : Application(), coil.ImageLoaderFactory {
             // TDLib 就绪后启动 v1→v2 相册 ID 回填（后台，不阻塞 UI）。
             // 用 sl.context（Application）而非 launch 作用域的 this（CoroutineScope）。
             sl.scheduleAlbumBackfill(sl.context)
+
+            // 「我的收藏」驱动器置顶：等真正 Ready 再挂（getMe 需要已登录），
+            // 未登录/超时就不做，下次启动重试 —— 不能因为没登录就永久跳过。
+            if (ready != null) {
+                sl.scheduleSavedMessagesPin()
+            }
         }
     }
 }
