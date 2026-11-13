@@ -39,6 +39,15 @@ android {
         }
     }
     val hasKeystore = keystoreProps.getProperty("storeFile")?.let { File(it).isFile } == true
+    // 可选调试凭据，仅从未跟踪的 local.properties 读取；无文件时提示用户自行填写。
+    val localProps = Properties().apply {
+        val f = rootProject.file("local.properties")
+        if (f.isFile) f.inputStream().use { load(it) }
+    }
+    val builtInApiId = localProps.getProperty("tg.apiId")?.toIntOrNull()?.takeIf { it > 0 } ?: 0
+    val builtInApiHash = localProps.getProperty("tg.apiHash")
+        ?.takeIf { it.matches(Regex("[0-9a-fA-F]{32}")) } ?: ""
+    val hasLocalApi = builtInApiId > 0 && builtInApiHash.isNotEmpty()
 
     signingConfigs {
         if (hasKeystore) {
@@ -56,6 +65,10 @@ android {
     }
 
     buildTypes {
+        all {
+            buildConfigField("int", "BUILT_IN_API_ID", if (name == "release") "0" else "$builtInApiId")
+            buildConfigField("String", "BUILT_IN_API_HASH", if (name == "release") "\"\"" else "\"$builtInApiHash\"")
+        }
         release {
             isMinifyEnabled = true
             isShrinkResources = true
@@ -68,7 +81,7 @@ android {
         }
         debug {
             applicationIdSuffix = ".debug"
-            buildConfigField("boolean", "ALLOW_BUILT_IN_CREDS", "true")
+            buildConfigField("boolean", "ALLOW_BUILT_IN_CREDS", "$hasLocalApi")
         }
 
         /**
@@ -103,7 +116,7 @@ android {
             versionNameSuffix = "-perf"
             // perf 构建 BuildConfig.DEBUG=false，内置凭据分支会被 R8 折叠。
             // 这里单独注入开关，让 perf 包仍能零配置登录（仅本机调试用）。
-            buildConfigField("boolean", "ALLOW_BUILT_IN_CREDS", "true")
+            buildConfigField("boolean", "ALLOW_BUILT_IN_CREDS", "$hasLocalApi")
         }
     }
     compileOptions {

@@ -8,6 +8,7 @@ captures/
 .externalNativeBuild/
 .cxx/
 app/build/
+dist/*.apk
 # TDLib 二进制由 scripts/fetch-tdlib.ps1 拉取，不入库
 app/src/main/jniLibs/**/*.so
 .kotlin/

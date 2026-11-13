@@ -20,12 +20,9 @@ import com.yg.tgdrive.BuildConfig
 class CredentialsStore(context: Context) {
 
     companion object {
-        /**
-         * 开发用 api 凭据（my.telegram.org 注册的 app，属主账号私有）。
-         * 仅 debug 构建读取；release 构建经 R8 死代码消除后不进入 dex。
-         */
-        const val BUILT_IN_API_ID = 0
-        const val BUILT_IN_API_HASH = "REDACTED"
+        /** 内置调试凭据由未跟踪的本地 Gradle 配置注入，仓库里不存实际值。 */
+        const val BUILT_IN_API_ID = BuildConfig.BUILT_IN_API_ID
+        const val BUILT_IN_API_HASH = BuildConfig.BUILT_IN_API_HASH
 
     }
 
