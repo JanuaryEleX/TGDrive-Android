@@ -29,6 +29,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -55,10 +56,12 @@ import com.yg.tgdrive.CrashLogger
 import com.yg.tgdrive.ServiceLocator
 import com.yg.tgdrive.data.ScanDiagnostics
 import com.yg.tgdrive.data.SelectableChat
+import com.yg.tgdrive.download.CacheUsage
 import com.yg.tgdrive.ui.common.AppIcons
 import com.yg.tgdrive.ui.common.DriveEntity
 import com.yg.tgdrive.ui.common.ProxyEditor
 import com.yg.tgdrive.ui.common.ProxyMode
+import com.yg.tgdrive.ui.common.formatSize
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.launch
@@ -86,6 +89,17 @@ fun SettingsScreen(onBack: () -> Unit) {
     var showLogoutConfirm by remember { mutableStateOf(false) }
     var showClearCacheConfirm by remember { mutableStateOf(false) }
     var showAbout by remember { mutableStateOf(false) }
+
+    // 已缓存字节：进页面读一次；清空缓存确认框关闭后重读（null = 还在统计）
+    var cachedBytes by remember { mutableStateOf<Long?>(null) }
+    LaunchedEffect(Unit) {
+        cachedBytes = runCatching { ServiceLocator.downloadManager.cachedBytes() }.getOrDefault(0L)
+    }
+    LaunchedEffect(showClearCacheConfirm) {
+        if (!showClearCacheConfirm) {
+            cachedBytes = runCatching { ServiceLocator.downloadManager.cachedBytes() }.getOrDefault(0L)
+        }
+    }
     // 【临时诊断】重扫取证入口的状态（定位视频丢因后整块删除）
     var diagRunning by remember { mutableStateOf(false) }
     var diagState by remember { mutableStateOf<String?>(null) }
@@ -176,6 +190,20 @@ fun SettingsScreen(onBack: () -> Unit) {
                         "已播放分片的磁盘缓存总量上限（LRU 逐出），1~64 GB。",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    val capBytes = cacheCapGb * 1024L * 1024L * 1024L
+                    val used = cachedBytes
+                    val usedText = if (used == null) "统计中…" else formatSize(used)
+                    Text(
+                        "已缓存：$usedText / ${cacheCapGb} GB" +
+                            if (used != null) "（${CacheUsage.percentOf(used, capBytes)}%）" else "",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    LinearProgressIndicator(
+                        progress = { if (used == null) 0f else CacheUsage.percentOf(used, capBytes) / 100f },
+                        modifier = Modifier.fillMaxWidth(),
                     )
                     Spacer(Modifier.height(8.dp))
                     Slider(
@@ -293,7 +321,10 @@ fun SettingsScreen(onBack: () -> Unit) {
             confirmButton = {
                 TextButton(onClick = {
                     showClearCacheConfirm = false
-                    scope.launch { runCatching { ServiceLocator.mediaRepository.clearCache() } }
+                    scope.launch {
+                        runCatching { ServiceLocator.mediaRepository.clearCache() }
+                        cachedBytes = runCatching { ServiceLocator.downloadManager.cachedBytes() }.getOrDefault(0L)
+                    }
                 }) { Text("清空") }
             },
             dismissButton = { TextButton(onClick = { showClearCacheConfirm = false }) { Text("取消") } },

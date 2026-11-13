@@ -382,6 +382,18 @@ class StreamingDownloadManager(
     }
 
     /**
+     * 设置页「已缓存」：LRU 池当前占用字节。
+     * 排除 `.at` 访问标记与 `.tmp` 拷贝临时文件，只统计真正可复用的整文件缓存。
+     */
+    suspend fun cachedBytes(): Long = withContext(Dispatchers.IO) {
+        val entries = lruDir.listFiles()
+            ?.filter { it.isFile }
+            ?.map { it.name to it.length() }
+            ?: emptyList()
+        CacheUsage.totalBytes(entries)
+    }
+
+    /**
      * 若该文件已被 TDLib 完整下载（local.is_downloading_completed=true），返回其本地完整文件，
      * 供播放层直连（零 TDLib 下载、跳过 faststart 重排）。未完成返回 null。
      *
