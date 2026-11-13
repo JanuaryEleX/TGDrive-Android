@@ -1,8 +1,8 @@
 package com.yg.tgdrive.ui.player
 
 /**
- * 临时「照抄现状」实现，仅用于让新测试先红：确认测试真的能抓到
- * 「播放恢复后错误层仍滞留」「重试提示不清」这两个缺陷。
+ * 临时现状实现仅供红灯测试：onReady 不清旧错误层 / 重试 HUD。
+ * 替换为状态机后重新执行所有单测。
  */
 internal data class PlayerOverlay(
     val hud: String? = null,
@@ -11,13 +11,16 @@ internal data class PlayerOverlay(
 
 internal object PlayerOverlayPolicy {
     internal const val RETRY_HUD_PREFIX = "播放中断，正在重试 "
-
     fun retryHud(attempt: Int, max: Int): String = "$RETRY_HUD_PREFIX$attempt/$max"
-
     fun onReady(current: PlayerOverlay): PlayerOverlay = current
-
     fun onPrepareStart(current: PlayerOverlay): PlayerOverlay = current.copy(error = null)
-
     fun onTerminalError(current: PlayerOverlay, message: String): PlayerOverlay =
         current.copy(error = message)
+}
+
+internal object PlaybackRetryOverlayPolicy {
+    private const val RETRY_PREFIX = "播放中断，正在重试 "
+    fun afterReady(current: String?): String? =
+        current?.takeUnless { it.startsWith(RETRY_PREFIX) }
+    fun afterTerminalError(current: String?): String? = afterReady(current)
 }
