@@ -194,6 +194,7 @@ class PlayerActivity : ComponentActivity() {
                     buffering.value = false
                     prepared.value = true
                     loading.value = false
+                    hudText.value = PlaybackRetryOverlayPolicy.afterReady(hudText.value)
                     autoRetry = 0
                     preparing = false
                     slowPrepare.value = false
@@ -303,6 +304,7 @@ class PlayerActivity : ComponentActivity() {
         title.value = entity.displayName
         metaLine.value = buildMeta(entity)
         errorText.value = null
+        hudText.value = PlaybackRetryOverlayPolicy.afterReady(hudText.value)
         prepared.value = false
         buffering.value = true
         loading.value = true
@@ -488,6 +490,7 @@ class PlayerActivity : ComponentActivity() {
             }
             return
         }
+        hudText.value = PlaybackRetryOverlayPolicy.afterTerminalError(hudText.value)
         errorText.value = describeError(error)
         loading.value = false
         pokeControls(true)
