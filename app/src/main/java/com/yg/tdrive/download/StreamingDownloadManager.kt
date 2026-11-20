@@ -697,7 +697,7 @@ class StreamingDownloadManager(
                         // 探针窗口**恒为** PROBE_BYTES，不随 need 收缩：缩到 1 字节时
                         // 那个字节若是合法 0x00/0xFF 就会被判成边界 → 永不推进 → 超时。
                         val run = confirmedRunIn(path, offset + confirmed, PROBE_BYTES.toLong())
-                        probed += PROBE_BYTES
+                        probed += PROBE_BYTES + (ReadableScan.MIN_FILL_RUN - 1)
                         if (run > 0L) {
                             val total = confirmed + run
                             lastConfirmed = total.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
@@ -772,10 +772,15 @@ class StreamingDownloadManager(
             RandomAccessFile(path, "r").use { raf ->
                 val fileLen = raf.length()
                 if (fileLen <= pos) return@use 0L
-                val want = minOf(limit, PROBE_BYTES.toLong())
-                val cap = minOf(want, fileLen - pos)
+                // 回读 MIN_FILL_RUN-1 字节上下文：上一个窗口可能在填充 run 的起点截断，
+                // 于是本窗口开头就是那个 run 的延续。不回读就无法区分「窗口起点落在
+                // 未落盘区内部」与「数据恰好以 0x00/0xFF 开头」，会把最多 1KB 填充放行。
+                val back = minOf(pos, (ReadableScan.MIN_FILL_RUN - 1).toLong())
+                val start = pos - back
+                val want = minOf(limit, PROBE_BYTES.toLong()) + back
+                val cap = minOf(want, fileLen - start)
                 if (cap <= 0L) return@use 0L
-                raf.seek(pos)
+                raf.seek(start)
                 val buf = ByteArray(cap.toInt())
                 var filled = 0
                 while (filled < buf.size) {
@@ -784,9 +789,10 @@ class StreamingDownloadManager(
                     filled += r
                 }
                 if (filled <= 0) return@use 0L
-                // 缓冲区尾是否就是文件真实末尾：短尾部填充只有在这里才算空洞。
-                val atEof = pos + filled >= fileLen
-                ReadableScan.runLength(buf, 0, filled, atEof = atEof).toLong()
+                val atEof = start + filled >= fileLen
+                val run = ReadableScan.runLength(buf, 0, filled, atEof = atEof)
+                // 边界落在 pos 之前 → pos 处仍不可读。
+                (run.toLong() - back).coerceAtLeast(0L)
             }
         }.getOrDefault(0L)
     }

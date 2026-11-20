@@ -7,7 +7,10 @@ import org.junit.Test
  * [ReadableScan.runLength] 的边界语义。
  *
  * 两组参数：`atEof = true` 表示缓冲区末尾就是文件真实末尾（文件末尾的填充必是未写区），
- * `atEof = false` 表示缓冲区只是文件中间的一个探测窗口（短尾部填充是合法数据）。
+ * `atEof = false` 表示缓冲区只是文件中间的一个探测窗口。
+ *
+ * 窗口末尾的短同值段（< 1KB）：`atEof = false` 时，前面已有可读数据则截断（前沿之后
+ * 的填充可能很短），整窗就是它则放行（否则探针卡死）；`atEof = true` 时一律截断。
  */
 class ReadableScanTest {
 
@@ -50,15 +53,16 @@ class ReadableScanTest {
     // ═══════════════════════ 尾部填充：关键分歧点 ═══════════════════════
 
     /**
-     * 窗口末字节是合法 0x00、且窗口不在文件末尾 → **整窗放行**。
+     * 窗口末字节是合法 0x00、且窗口不在文件末尾 → 截断到 4095。
      *
-     * 无条件截断尾部会让探针在下一轮只读到这一个同值字节 → 又判边界 → 长度 0 →
-     * 永不推进 → 60s 超时抛错。孤立的同值字节是数据，不是填充。
+     * 短于阈值的尾部同值段前面已有可读数据时一律截断：TDLib 顺序落盘，前沿之后的
+     * 填充完全可能只有几字节。返回值仍 > 0，探针继续推进；下一轮回读上下文即可
+     * 区分「填充继续」与「数据里恰好一个 0x00」。
      */
-    @Test fun singleTrailingFillByteInWindowIsData() {
+    @Test fun singleTrailingFillByteTruncates() {
         val buf = data(4096)
         buf[4095] = 0
-        assertEquals(4096, ReadableScan.runLength(buf, 0, buf.size, atEof = false))
+        assertEquals(4095, ReadableScan.runLength(buf, 0, buf.size, atEof = false))
     }
 
     /** 同一缓冲区若确实是文件末尾 → 尾部 1 字节填充就是未写区。 */
@@ -68,11 +72,11 @@ class ReadableScanTest {
         assertEquals(4095, ReadableScan.runLength(buf, 0, buf.size, atEof = true))
     }
 
-    /** 窗口尾部短填充（< 阈值）后紧跟窗口边界 → 按数据放行，探针不会卡住。 */
-    @Test fun tailFillShorterThanThresholdInWindowIsData() {
+    /** 窗口尾部短填充（< 阈值）且前面有可读数据 → 同样截断，最多泄漏 1KB 填充。 */
+    @Test fun tailFillShorterThanThresholdTruncates() {
         val buf = data(4096)
         ByteArray(1023).copyInto(buf, 3073)
-        assertEquals(4096, ReadableScan.runLength(buf, 0, buf.size, atEof = false))
+        assertEquals(3073, ReadableScan.runLength(buf, 0, buf.size, atEof = false))
     }
 
     /** 同一形态在文件末尾 → 截断到 3073。 */
@@ -120,6 +124,22 @@ class ReadableScanTest {
         assertEquals(4096, ReadableScan.runLength(buf, 0, buf.size, atEof = true))
     }
 
+    /**
+     * 窗口**起点**落在填充 run 中段 → 必须是边界。
+     *
+     * 这是 `StreamingDownloadManager.confirmedRunIn` 回读 `MIN_FILL_RUN-1` 字节上下文
+     * 的原因：上一个探针窗口可能在填充 run 的起点就截断了，于是下一个窗口开头就是
+     * 同一个 run 的延续。不回读上下文，这个窗口看起来只是「短内部 run + 数据」，
+     * 会把最多 1KB 填充放行给解码器。
+     */
+    @Test fun windowStartingInsideFillRunIsABoundary() {
+        val buf = ByteArray(8192)
+        data(2048, 0x21).copyInto(buf, 6144)
+        assertEquals(0, ReadableScan.runLength(buf, 3000, buf.size - 3000, atEof = false))
+        // 填充结束后第一个数据字节 → 整段放行，不得因回读而卡住。
+        assertEquals(2048, ReadableScan.runLength(buf, 6144, buf.size - 6144, atEof = false))
+    }
+
     /** 内部填充段长度刚好等于阈值 → 截断。 */
     @Test fun interiorFillRunExactlyAtThresholdTruncates() {
         val buf = ByteArray(4096)
@@ -164,7 +184,12 @@ class ReadableScanTest {
         assertEquals(1024, ReadableScan.runLength(buf, 2048, 4096, atEof = true))
     }
 
-    /** 单字节窗口不在文件末尾 → 一律当数据（不能判边界，否则探针卡死）。 */
+    /**
+     * 单字节窗口不在文件末尾 → 一律当数据。
+     *
+     * 这是卡死缺陷的回归：整窗就是一段短同值段（`runStart == from`）时若返回 0，
+     * 探针永不推进 → 60s 超时抛 DownloadException。
+     */
     @Test fun singleByteWindowInFileIsData() {
         assertEquals(1, ReadableScan.runLength(byteArrayOf(0), 0, 1, atEof = false))
         assertEquals(1, ReadableScan.runLength(byteArrayOf(0x41), 0, 1, atEof = false))
