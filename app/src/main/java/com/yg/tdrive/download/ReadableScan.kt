@@ -50,8 +50,8 @@ object ReadableScan {
      * @return 连续可读字节数；[from] 处就是边界 → 0
      */
     fun runLength(bytes: ByteArray, from: Int, limit: Int, minFillRun: Int = MIN_FILL_RUN): Int {
-        if (from < 0 || limit <= 0 || from >= bytes.size) return 0
         require(minFillRun > 0) { "minFillRun 必须 > 0" }
+        if (from < 0 || limit <= 0 || from >= bytes.size) return 0
         val end = minOf(bytes.size.toLong(), from.toLong() + limit.toLong()).toInt()
         if (end <= from) return 0
 
