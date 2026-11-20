@@ -761,10 +761,11 @@ class StreamingDownloadManager(
      * 预分配填充照样被放行，Mp4Extractor 把填充当 box header、解码器把填充当
      * 码流 —— 这正是「画面花屏」的直接成因。
      *
-     * 现在由 [ReadableScan.runLength] 按同值填充 run 定长度：≥1KB 的段一律截断，
-     * 而**短于阈值的尾部填充只在真正到达文件末尾时**才截断 —— 否则窗口末字节恰好
-     * 是合法 0x00/0xFF 时会被误判成边界，探针推进 0 字节后永远卡住。单次扫描上限
-     * [PROBE_BYTES]，由 [awaitDataLocked] 的循环逐步向后推进，读放大保持有界。
+     * 现在由 [ReadableScan.runLength] 按同值填充 run 定长度：≥1KB 的段一律截断；
+     * 短于阈值的尾部段若前面已有可读数据也截断（前沿之后的填充可能很短），整窗
+     * 就是这一段时才放行 —— 否则窗口末字节恰好是合法 0x00/0xFF 会被误判成边界，
+     * 探针推进 0 字节后永远卡住。单次扫描上限 [PROBE_BYTES]（另加 1KB 回读上下文），
+     * 由 [awaitDataLocked] 的循环逐步向后推进，读放大保持有界。
      */
     private fun confirmedRunIn(path: String, pos: Long, limit: Long): Long {
         if (limit <= 0L) return 0L
