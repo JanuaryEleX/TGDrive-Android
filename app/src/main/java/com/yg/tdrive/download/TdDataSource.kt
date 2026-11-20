@@ -158,10 +158,17 @@ class TdDataSource(
 
             // TDLib partial 是预分配的稀疏文件：文件长度 = 总大小，未落盘区域读出来是全零。
             // 因此单次读取必须钳制到「已确认落盘」的连续区间，否则会把空洞当数据交给解析器。
+            // 账本在此刻为空 = 会话刚被重置/重建，此时哪怕只读 1 字节也是在读填充；
+            // 抛 IOException 让 ExoPlayer 重试（重新走 ensureRange 拿真实数据），
+            // 绝不用 RESULT_END_OF_INPUT 谎报 EOF —— 那会让解析器把截断的码流当完整文件。
             val safe = mgr.readableBytesFrom(fileId, position)
+            if (safe <= 0L) {
+                if (totalRead > 0) break
+                throw IOException("partial 未确认落盘 file=$fileId pos=$position")
+            }
             val toRead = minOf(
                 remaining.toLong(),
-                safe.coerceAtLeast(1L),
+                safe,
                 r.globalOffset + fileLen - position,
                 endPosition - position,
             ).coerceAtLeast(1L).toInt()
