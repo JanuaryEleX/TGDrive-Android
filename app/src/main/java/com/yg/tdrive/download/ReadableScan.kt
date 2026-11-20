@@ -12,16 +12,24 @@ package com.yg.tgdrive.download
  * 字节，就把整个 64KB 登记为「连续已落盘」。真实数据只落了前 1KB 时，剩下 63KB 的
  * 填充照样被放行 —— 这是花屏反复出现的直接成因。
  *
- * 现判据两条，取更靠前的边界：
+ * 判据：窗口内出现 **≥ [MIN_FILL_RUN] 字节的全 0x00 / 全 0xFF 连续段**，其起点即可读
+ * 边界（取最靠前的一段）。短于阈值的尾部同值段**只有确认到达文件真实末尾时**才截断
+ * （见 [runLength] 的 `atEof`）。
  *
- * 1. **尾部填充**：窗口末尾若是全 0x00 / 全 0xFF 的连续段，不论多短都截断到它的起点。
- *    TDLib 顺序落盘，前沿之后必是填充，所以尾部填充一定是未写区。哪怕只剩 1 字节，
- *    放行也会污染最后一帧。
- * 2. **内部长填充**：窗口内部出现 ≥ [MIN_FILL_RUN] 的全 0x00 / 全 0xFF 连续段也截断。
- *    这一条覆盖「`downloadFile` 指定的高优先区间 + 后台顺序下载」并存时的形态：
- *    窗口开头可能是空洞、后面却有数据，只看尾部会把开头的空洞放行。
+ * ## 为什么尾部不能无条件截断
  *
- * 阈值而非「任意同值段」是为了避开合法数据：mp4 的 box size 高字节本来就是 0x00
+ * 「尾部填充不论多短都截断」听起来更安全，实际会造成**永久卡死**：真实码流的最后
+ * 一字节完全可能是合法的 0x00 或 0xFF（概率 2/256）。截断它 → 下一轮探针从该处
+ * 重读 → 只有一个同值字节 → 又是「尾部填充」→ 长度 0 → 永不推进 → 60s 超时抛
+ * `DownloadException`。花屏变成整段播放失败，更糟。
+ *
+ * 所以「尾部」只有在等于**文件末尾**时才有意义：文件已预分配到完整长度，末尾仍是
+ * 填充就说明没写完。探测窗口的末尾 ≠ 文件末尾，那里的同值字节只是普通数据。
+ *
+ * 真正的空洞动辄几百 KB（TDLib 按块预分配），不可能只有 1 字节。阈值判定天然
+ * 区分两者：孤立的同值字节是数据，连续 1KB 同值才是未落盘。
+ *
+ * 阈值而非「任意同值段」还为了避开合法结构：mp4 的 box size 高字节本来就是 0x00
  * （`ftyp`/`moov` 都以 `00 00 00 xx` 开头），样本对齐也会产生零散零字节。4 字节的
  * 零高字节远小于 1KB，不会误判。
  *
@@ -46,10 +54,21 @@ object ReadableScan {
      * @param bytes 缓冲区
      * @param from 起始下标
      * @param limit 最多考察的字节数（自 [from] 起，超出缓冲区按缓冲区尾算）
-     * @param minFillRun 内部填充 run 的判定阈值，测试可调小
+     * @param minFillRun 同值填充 run 的判定阈值，测试可调小
+     * @param atEof 缓冲区末尾是否就是**文件的真实末尾**。为 true 时尾部同值段
+     *   不论多短都算空洞（文件已预分配到完整长度，末尾仍是填充就说明没写完）；
+     *   为 false 时按阈值判 —— 否则窗口末字节恰好是合法 0x00/0xFF 就会被截断，
+     *   下一轮只读到那 1 字节 → 又判边界 → 永不推进 → 超时抛错。
+     *   无默认值：这个判断必须由调用方基于文件长度显式给出。
      * @return 连续可读字节数；[from] 处就是边界 → 0
      */
-    fun runLength(bytes: ByteArray, from: Int, limit: Int, minFillRun: Int = MIN_FILL_RUN): Int {
+    fun runLength(
+        bytes: ByteArray,
+        from: Int,
+        limit: Int,
+        minFillRun: Int = MIN_FILL_RUN,
+        atEof: Boolean,
+    ): Int {
         require(minFillRun > 0) { "minFillRun 必须 > 0" }
         if (from < 0 || limit <= 0 || from >= bytes.size) return 0
         val end = minOf(bytes.size.toLong(), from.toLong() + limit.toLong()).toInt()
@@ -61,8 +80,10 @@ object ReadableScan {
             // 同值 run 在 i 处闭合；i == end 时强制闭合，避免越界读。
             if (i == end || bytes[i] != prev) {
                 if (isFillByte(prev)) {
-                    val isTail = i == end
-                    if (isTail || i - runStart >= minFillRun) return runStart - from
+                    val closedAtBufferEnd = i == end
+                    // 到达真实文件末尾 → 尾部填充不论长短都是未写区。
+                    // 否则要求达到阈值：孤立/零散的同值字节是合法数据。
+                    if ((closedAtBufferEnd && atEof) || i - runStart >= minFillRun) return runStart - from
                 }
                 runStart = i
             }

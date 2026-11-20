@@ -668,6 +668,11 @@ class StreamingDownloadManager(
         var nextSnapshotAt = t0 + SNAPSHOT_FALLBACK_MS
         var polls = 0
         var lastConfirmed = 0
+        var probed = 0L
+        // 连续探针的读放大上限：确认 need 字节最多需要 need + 一个窗口的探测量。
+        // 超过就退回轮询间隔，避免病态数据（每隔 1KB 才有一个数据字节）在本函数里
+        // 空转成无限次 64KB 读。
+        val probeBudget = need + PROBE_BYTES
         try {
             while (true) {
                 coroutineContext.ensureActive()
@@ -688,19 +693,23 @@ class StreamingDownloadManager(
                     // 旧实现只要 64KB 窗口里有一个非零字节就整窗登记，真实数据只落了前
                     // 1KB 时余下 63KB 填充照样放行 —— 花屏的直接成因。
                     val confirmed = s.readableFrom(offset)
-                    val want = minOf(need - confirmed, PROBE_BYTES.toLong())
-                    val run = if (want > 0L) confirmedRunIn(path, offset + confirmed, want) else 0L
-                    if (run > 0L) {
-                        val total = confirmed + run
-                        lastConfirmed = total.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
-                        s.markReadable(offset, offset + total)
-                        if (s.readableFrom(offset) >= need) {
-                            PlaybackDiag.probe(offset, polls, lastConfirmed, SystemClock.elapsedRealtime() - t0, "disk")
-                            return
+                    if (need - confirmed > 0L) {
+                        // 探针窗口**恒为** PROBE_BYTES，不随 need 收缩：缩到 1 字节时
+                        // 那个字节若是合法 0x00/0xFF 就会被判成边界 → 永不推进 → 超时。
+                        val run = confirmedRunIn(path, offset + confirmed, PROBE_BYTES.toLong())
+                        probed += PROBE_BYTES
+                        if (run > 0L) {
+                            val total = confirmed + run
+                            lastConfirmed = total.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+                            s.markReadable(offset, offset + total)
+                            if (s.readableFrom(offset) >= need) {
+                                PlaybackDiag.probe(offset, polls, lastConfirmed, SystemClock.elapsedRealtime() - t0, "disk")
+                                return
+                            }
+                            // 整窗都是数据 → 立刻接着探下一窗，不必等轮询间隔。
+                            // 每轮 confirmed 至少前进 1 字节，且探针预算封顶，循环有界。
+                            if (probed < probeBudget) continue
                         }
-                        // 整窗都是数据 → 立刻接着探下一窗，不必等轮询间隔。
-                        // 只在 run == want 时继续，保证每轮推进 ≥1 字节且循环次数有界。
-                        if (run >= want) continue
                     }
                 }
                 val now = SystemClock.elapsedRealtime()
@@ -752,8 +761,9 @@ class StreamingDownloadManager(
      * 预分配填充照样被放行，Mp4Extractor 把填充当 box header、解码器把填充当
      * 码流 —— 这正是「画面花屏」的直接成因。
      *
-     * 现在由 [ReadableScan.runLength] 按填充边界定长度：尾部填充不论多短都截断，
-     * 内部 ≥1KB 的同值填充段也截断，只返回真正连续的那一段。单次扫描上限
+     * 现在由 [ReadableScan.runLength] 按同值填充 run 定长度：≥1KB 的段一律截断，
+     * 而**短于阈值的尾部填充只在真正到达文件末尾时**才截断 —— 否则窗口末字节恰好
+     * 是合法 0x00/0xFF 时会被误判成边界，探针推进 0 字节后永远卡住。单次扫描上限
      * [PROBE_BYTES]，由 [awaitDataLocked] 的循环逐步向后推进，读放大保持有界。
      */
     private fun confirmedRunIn(path: String, pos: Long, limit: Long): Long {
@@ -762,7 +772,8 @@ class StreamingDownloadManager(
             RandomAccessFile(path, "r").use { raf ->
                 val fileLen = raf.length()
                 if (fileLen <= pos) return@use 0L
-                val cap = minOf(limit, fileLen - pos, PROBE_BYTES.toLong())
+                val want = minOf(limit, PROBE_BYTES.toLong())
+                val cap = minOf(want, fileLen - pos)
                 if (cap <= 0L) return@use 0L
                 raf.seek(pos)
                 val buf = ByteArray(cap.toInt())
@@ -773,7 +784,9 @@ class StreamingDownloadManager(
                     filled += r
                 }
                 if (filled <= 0) return@use 0L
-                ReadableScan.runLength(buf, 0, filled).toLong()
+                // 缓冲区尾是否就是文件真实末尾：短尾部填充只有在这里才算空洞。
+                val atEof = pos + filled >= fileLen
+                ReadableScan.runLength(buf, 0, filled, atEof = atEof).toLong()
             }
         }.getOrDefault(0L)
     }
