@@ -147,7 +147,8 @@ class TdClient(private val scope: CoroutineScope) {
 
 **关键事实**（实现依据）：
 - TDLib `downloadFile(file_id, offset, limit, priority)` 的 `offset` 按 512KB（`PART_SIZE`）对齐生效，下载内容追加到该 file 的 `local.partial_path` 文件
-- `updateFile` 携带 `local.downloaded_prefix_size`：自**本次请求 offset** 起连续可读的前缀长度；这是「这段已落盘可读」的唯一判据
+- `updateFile` 携带 `local.downloaded_prefix_size`：自**本次请求 offset** 起连续可读的前缀长度；这是「这段已落盘可读」的主判据（零 IO 快路径，也是 mdat 内存在合法全零数据时唯一安全的路径）
+- 前缀未覆盖（seek 到前缀之外）时退回**磁盘真值探针**：读 partial 的 64KB 窗口，按填充 run 定边界，只登记逐块验证过的连续长度（`ReadableScan`）。预分配区读出来是 0x00（部分代理为 0xFF），**绝不能**「窗口里有一个非零字节就整窗放行」——那会把填充当码流交给解析器，表现为花屏
 - `cancelDownloadFile(file_id, only_pending=true)` 只取消排队未启动的分片，已落盘的不丢——seek 后用它避免旧窗口继续烧流量
 - 播放中同时 `openChat` 该聊天，可提升服务端文件分发优先级（官方流播同款行为）
 
