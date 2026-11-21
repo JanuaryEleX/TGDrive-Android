@@ -84,9 +84,13 @@ class TdVirtualDataSource(
             // TDLib partial 是预分配稀疏文件：长度够 ≠ 数据已落盘。必须按「连续已确认
             // 字节数」钳制本次 read，否则会把空洞里的全零当码流交给解码器（花屏/解析失败）。
             val safe = mgr.readableBytesFrom(plan.fileId, real)
+            if (safe <= 0L) {
+                if (total > 0) break
+                throw IOException("虚拟读取未确认落盘 file=${plan.fileId} vpos=$position real=$real")
+            }
             val toRead = minOf(
                 chunkLen,
-                safe.coerceAtLeast(1L),
+                safe,
                 ref.globalOffset + fileLen - real,
             ).coerceAtLeast(1L).toInt()
             val n = handle.read(buffer, bufOff, toRead)

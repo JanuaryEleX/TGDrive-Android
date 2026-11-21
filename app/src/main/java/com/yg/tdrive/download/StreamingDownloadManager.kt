@@ -80,8 +80,8 @@ class StreamingDownloadManager(
         private const val WAIT_TIMEOUT_MS = 60_000L
 
         /**
-         * 探针读取窗口 = 单次 read 的落盘确认粒度。任意非零字节即视为该窗口已落盘，
-         * 并把 [FileSession.confirmedEnd] 推进到窗口末尾（后续读同一区间不再探测）。
+         * 单次磁盘探针的读取窗口。窗口内的填充边界由 [ReadableScan] 判定，
+         * 只登记真正连续的已落盘长度（不再"有非零字节即整窗放行"）。
          */
         private const val PROBE_BYTES = 64 * 1024
 
@@ -656,7 +656,8 @@ class StreamingDownloadManager(
      * 2. TDLib 自报的连续前缀覆盖 [offset, offset+need) → 放行。单请求模型下
      *    `downloaded_prefix_size` 不再有"多窗口串台"歧义（同一 file 恒只有一条请求），
      *    这是零 IO 的快路径，也是 mdat 里存在合法全零数据时不会误判的唯一安全路径；
-     * 3. 磁盘真值探针（[nonZeroIn]）：前缀未覆盖（seek 到前缀之外）时用它确认落盘。
+     * 3. 磁盘真值探针（[confirmedRunIn]）：前缀未覆盖（seek 到前缀之外）时用它确认落盘，
+     *    只登记**逐块验证过**的连续长度（见 [ReadableScan]），不整窗放行。
      *
      * 只在快照兜底间隔刷新一次 getFile（不再像旧版每 200ms 重发 downloadFile ——
      * 那会让 TDLib 反复重置游标，是「速度归零」的直接成因之一）。
@@ -666,33 +667,59 @@ class StreamingDownloadManager(
         val deadline = t0 + WAIT_TIMEOUT_MS
         var nextSnapshotAt = t0 + SNAPSHOT_FALLBACK_MS
         var polls = 0
-        var lastNonZero = 0
+        var lastConfirmed = 0
+        var probed = 0L
+        // 连续探针的读放大上限：确认 need 字节最多需要 need + 一个窗口的探测量。
+        // 超过就退回轮询间隔，避免病态数据（每隔 1KB 才有一个数据字节）在本函数里
+        // 空转成无限次 64KB 读。
+        val probeBudget = need + PROBE_BYTES
         try {
             while (true) {
                 coroutineContext.ensureActive()
                 if (s.completed.value) {
-                    PlaybackDiag.probe(offset, polls, lastNonZero, SystemClock.elapsedRealtime() - t0, "completed")
+                    PlaybackDiag.probe(offset, polls, lastConfirmed, SystemClock.elapsedRealtime() - t0, "completed")
                     return
                 }
                 // 需求整段落在某个「连续已确认区间」内 → 快路径放行。
                 // 注意必须用 readableFrom（连续语义），不能用最高水位：尾部探针成功
                 // 不代表中间已落盘，否则会把全零空洞当数据交出去。
                 if (s.readableFrom(offset) >= need) {
-                    PlaybackDiag.probe(offset, polls, lastNonZero, SystemClock.elapsedRealtime() - t0, "confirmed")
+                    PlaybackDiag.probe(offset, polls, lastConfirmed, SystemClock.elapsedRealtime() - t0, "confirmed")
                     return
                 }
                 val path = s.partialPath.value
                 if (path != null) {
-                    val n = nonZeroIn(path, offset)
-                    if (n > 0) {
-                        lastNonZero = n
-                        // 只登记"这一段真的可读"，绝不外扩到其他偏移
-                        s.markReadable(offset, offset + PROBE_BYTES)
-                        PlaybackDiag.probe(offset, polls, n, SystemClock.elapsedRealtime() - t0, "disk")
-                        return
+                    // 从「已确认区间的末尾」继续往后探，只登记逐块验证过的连续长度。
+                    // 旧实现只要 64KB 窗口里有一个非零字节就整窗登记，真实数据只落了前
+                    // 1KB 时余下 63KB 填充照样放行 —— 花屏的直接成因。
+                    val confirmed = s.readableFrom(offset)
+                    if (need - confirmed > 0L) {
+                        // 探针窗口**恒为** PROBE_BYTES，不随 need 收缩：缩到 1 字节时
+                        // 那个字节若是合法 0x00/0xFF 就会被判成边界 → 永不推进 → 超时。
+                        val run = confirmedRunIn(path, offset + confirmed, PROBE_BYTES.toLong())
+                        probed += PROBE_BYTES + (ReadableScan.MIN_FILL_RUN - 1)
+                        if (run > 0L) {
+                            val total = confirmed + run
+                            lastConfirmed = total.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+                            s.markReadable(offset, offset + total)
+                            if (s.readableFrom(offset) >= need) {
+                                PlaybackDiag.probe(offset, polls, lastConfirmed, SystemClock.elapsedRealtime() - t0, "disk")
+                                return
+                            }
+                            // 整窗都是数据 → 立刻接着探下一窗，不必等轮询间隔。
+                            // 每轮 confirmed 至少前进 1 字节，且探针预算封顶，循环有界。
+                            if (probed < probeBudget) continue
+                        }
                     }
                 }
                 val now = SystemClock.elapsedRealtime()
+                if (now >= deadline) {
+                    PlaybackDiag.probe(offset, polls, lastConfirmed, now - t0, "timeout")
+                    throw DownloadException(
+                        "file ${s.fileId} offset=$offset 区域 ${WAIT_TIMEOUT_MS / 1000}s 内未落盘" +
+                            "（base=${s.base} prefix=${s.readable.value} tag=$tag）"
+                    )
+                }
                 if (now >= nextSnapshotAt) {
                     nextSnapshotAt = now + SNAPSHOT_FALLBACK_MS
                     runCatching {
@@ -702,14 +729,7 @@ class StreamingDownloadManager(
                             establishBaseline = false,
                         )
                     }
-                    if (s.completed.value) continue
-                }
-                if (now >= deadline) {
-                    PlaybackDiag.probe(offset, polls, 0, now - t0, "timeout")
-                    throw DownloadException(
-                        "file ${s.fileId} offset=$offset 区域 ${WAIT_TIMEOUT_MS / 1000}s 内未落盘" +
-                            "（base=${s.base} prefix=${s.readable.value} tag=$tag）"
-                    )
+                    continue
                 }
                 polls++
                 delay(PROBE_POLL_MS)
@@ -718,7 +738,7 @@ class StreamingDownloadManager(
             throw t
         } catch (t: Throwable) {
             if (t is DownloadException) throw t
-            PlaybackDiag.probe(offset, polls, lastNonZero, SystemClock.elapsedRealtime() - t0, "error:${t.message}")
+            PlaybackDiag.probe(offset, polls, lastConfirmed, SystemClock.elapsedRealtime() - t0, "error:${t.message}")
             throw t
         }
     }
@@ -733,30 +753,50 @@ class StreamingDownloadManager(
         return s.readableFrom(pos)
     }
 
-    /** 读 [pos] 起的 [PROBE_BYTES] 字节，返回非零字节数（0 = 空洞或不可读）。 */
-    private fun nonZeroIn(path: String, pos: Long): Int = runCatching {
-        RandomAccessFile(path, "r").use { raf ->
-            if (raf.length() <= pos) return@use 0
-            raf.seek(pos)
-            val buf = ByteArray(PROBE_BYTES)
-            val n = raf.read(buf)
-            if (n <= 0) {
-                0
-            } else {
-                var nonZero = 0
-                var allFF = true
-                for (i in 0 until n) {
-                    val b = buf[i].toInt() and 0xFF
-                    if (b != 0) nonZero++
-                    if (b != 0xFF) allFF = false
+    /**
+     * 从 [pos] 起**真正连续落盘**的字节数（0 = 该处仍是空洞 / 不可读）。
+     *
+     * 与旧 `nonZeroIn` 的关键区别：旧判据只要 64KB 窗口里存在**一个**非零字节，
+     * 就把整个窗口登记为已落盘。真实数据只落了前 1KB 时，剩下 63KB 的 TDLib
+     * 预分配填充照样被放行，Mp4Extractor 把填充当 box header、解码器把填充当
+     * 码流 —— 这正是「画面花屏」的直接成因。
+     *
+     * 现在由 [ReadableScan.runLength] 按同值填充 run 定长度：≥1KB 的段一律截断；
+     * 短于阈值的尾部段若前面已有可读数据也截断（前沿之后的填充可能很短），整窗
+     * 就是这一段时才放行 —— 否则窗口末字节恰好是合法 0x00/0xFF 会被误判成边界，
+     * 探针推进 0 字节后永远卡住。单次扫描上限 [PROBE_BYTES]（另加 1KB 回读上下文），
+     * 由 [awaitDataLocked] 的循环逐步向后推进，读放大保持有界。
+     */
+    private fun confirmedRunIn(path: String, pos: Long, limit: Long): Long {
+        if (limit <= 0L) return 0L
+        return runCatching {
+            RandomAccessFile(path, "r").use { raf ->
+                val fileLen = raf.length()
+                if (fileLen <= pos) return@use 0L
+                // 回读 MIN_FILL_RUN-1 字节上下文：上一个窗口可能在填充 run 的起点截断，
+                // 于是本窗口开头就是那个 run 的延续。不回读就无法区分「窗口起点落在
+                // 未落盘区内部」与「数据恰好以 0x00/0xFF 开头」，会把最多 1KB 填充放行。
+                val back = minOf(pos, (ReadableScan.MIN_FILL_RUN - 1).toLong())
+                val start = pos - back
+                val want = minOf(limit, PROBE_BYTES.toLong()) + back
+                val cap = minOf(want, fileLen - start)
+                if (cap <= 0L) return@use 0L
+                raf.seek(start)
+                val buf = ByteArray(cap.toInt())
+                var filled = 0
+                while (filled < buf.size) {
+                    val r = raf.read(buf, filled, buf.size - filled)
+                    if (r <= 0) break
+                    filled += r
                 }
-                // 真机实测（temp/2627）：TDLib 某些未落盘区域被预填成 0xFF 而不是 0。
-                // 「有非零字节 = 已落盘」的判据会被这种填充骗过，把填充当数据交出去。
-                // 整窗全 0xFF 一律按空洞处理。
-                if (allFF) 0 else nonZero
+                if (filled <= 0) return@use 0L
+                val atEof = start + filled >= fileLen
+                val run = ReadableScan.runLength(buf, 0, filled, atEof = atEof)
+                // 边界落在 pos 之前 → pos 处仍不可读。
+                (run.toLong() - back).coerceAtLeast(0L)
             }
-        }
-    }.getOrDefault(0)
+        }.getOrDefault(0L)
+    }
 
     // ═══════════════════════ 状态应用（file 对象 → 会话） ═══════════════════════
 

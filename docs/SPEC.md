@@ -147,7 +147,11 @@ class TdClient(private val scope: CoroutineScope) {
 
 **关键事实**（实现依据）：
 - TDLib `downloadFile(file_id, offset, limit, priority)` 的 `offset` 按 512KB（`PART_SIZE`）对齐生效，下载内容追加到该 file 的 `local.partial_path` 文件
-- `updateFile` 携带 `local.downloaded_prefix_size`：自**本次请求 offset** 起连续可读的前缀长度；这是「这段已落盘可读」的唯一判据
+- `updateFile` 携带 `local.downloaded_prefix_size`：自**本次请求 offset** 起连续可读的前缀长度；这是「这段已落盘可读」的主判据（零 IO 快路径，也是 mdat 内存在合法全零数据时唯一安全的路径）
+- 前缀未覆盖（seek 到前缀之外）时退回**磁盘真值探针**：读 partial 的 64KB 窗口，按填充 run 定边界，只登记逐块验证过的连续长度（`ReadableScan`）。预分配区读出来是 0x00（部分代理为 0xFF），**绝不能**「窗口里有一个非零字节就整窗放行」——那会把填充当码流交给解析器，表现为花屏
+  - 边界判据：窗口内出现 ≥1KB 的全 0x00/全 0xFF 连续段即截断；短于 1KB 的**尾部**同值段，若它前面已有可读数据则同样截断（下载前沿之后的填充完全可能短于 1KB），整窗就是这一段短同值段时则放行——否则探针推进 0 字节后永久卡死（60s 超时抛错，比花屏更糟）；只有真正到达文件末尾（`atEof`）时才无条件截断
+  - 探针窗口恒为 64KB，不随剩余需求量收缩——缩到 1 字节时上述卡死必然触发
+  - 探针向前回读 `MIN_FILL_RUN-1` 字节上下文：上一个窗口可能在填充 run 的起点截断，不回读就无法区分「窗口起点落在未落盘区内部」与「数据恰好以 0x00/0xFF 开头」，会把最多 1KB 填充放行
 - `cancelDownloadFile(file_id, only_pending=true)` 只取消排队未启动的分片，已落盘的不丢——seek 后用它避免旧窗口继续烧流量
 - 播放中同时 `openChat` 该聊天，可提升服务端文件分发优先级（官方流播同款行为）
 
